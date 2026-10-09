@@ -1,0 +1,5 @@
+{
+  "kube-prometheus-stack-82.4.3.tgz": "62d2fc381eeda4fb2bb8e63104d5cc1d192a3eaa53e7d0cc43fa3da97bfdb0b9",
+  "prometheus-adapter-5.3.0.tgz": "aa6752b6207ed788522714c3ef7f67f27d423eb4d9512fecb52dc641b6434f31",
+  "k8s-aibom-1.5.1.tgz": "81cb75d8ce1f538ad959d9876bf773a15b225e0572aa58b99c3032d8a497acdd"
+}
