@@ -14,6 +14,9 @@ gh workflow run powerhrg-release.yml --repo powerhome/vllm-production-stack \
 ```
 
 The two optional inputs are `source_branch` (default `powerhrg`) and `output_tag`.
+Source commits whose workflow files differ from `powerhrg` may require workflow
+write permission for tagging/releasing, which `GITHUB_TOKEN` cannot grant. Use
+matching workflow definitions when selecting another source branch.
 With chart version `0.1.13`, an empty output tag selects
 `vllm-stack-0.1.13-powerhrg-N`, where `N` is the highest existing matching suffix
 plus one. Releases, drafts, remote tags, chart assets and package tags count.
