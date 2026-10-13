@@ -58,11 +58,18 @@ cat router-v0.1.13-powerhrg-7.tar.gz.part[0-9][0-9][0-9] | docker load
 ```
 
 Publication spans GHCR and GitHub Releases. A failure after tag creation retains
-its partial publication and fails the run; it never overwrites or deletes
-published resources. Inspect the failed run and reserved draft before choosing
+its partial publication and fails the run without automatic cleanup.
+Inspect the failed run and reserved draft before choosing
 a new version. Publication failures need manual assessment rather than blindly
 rerunning the publish job. The workflow pulls the published OCI chart and checks
 its archive checksum before making the release public.
+
+This serialized workflow exclusively owns the versioned router, operator and
+chart tags in its GHCR namespace. It checks collisions during preparation and
+again immediately before each push; a collision or API error aborts publication.
+GHCR tags are mutable and these checks cannot prevent a concurrent external
+writer from changing a tag. Other publishers must coordinate with this workflow;
+use the recorded digests when consuming immutable artifacts.
 
 Release dependencies are verified against
 `scripts/powerhrg_chart_dependencies.json`, whose hashes are the OCI chart-content

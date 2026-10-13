@@ -321,6 +321,17 @@ def registry_digest(image):
     return value
 
 
+def ensure_package_tag_absent(gh, package_name, tag):
+    # GHCR tags are mutable. This workflow exclusively owns its release
+    # namespace; recheck after slow archive loading, just before each push.
+    for package in gh.pages("orgs/powerhome/packages?package_type=container"):
+        if package["name"] != package_name:
+            continue
+        for version in gh.pages("orgs/powerhome/packages/container/" + quote(package_name) + "/versions"):
+            if tag in version["metadata"]["container"]["tags"]:
+                raise RuntimeError(f"package tag already exists: {package_name}:{tag}")
+
+
 def publish(args):
     gh, state = GitHub(), read_json(args.state)
     directory = Path(args.packages)
@@ -363,9 +374,11 @@ def publish(args):
                 loader.wait()
                 raise
         image = f'ghcr.io/{REPOSITORY}/{package}:{state["image_tag"]}'
+        ensure_package_tag_absent(gh, f"vllm-production-stack/{package}", state["image_tag"])
         run("docker", "push", image, timeout=1800)
         manifest["images"][component] = {"reference": image, "digest": registry_digest(image), "archives": metadata["parts"]}
         run("docker", "image", "rm", image)
+    ensure_package_tag_absent(gh, "vllm-production-stack/charts/vllm-stack", state["chart_version"])
     output = run("helm", "push", str(chart), f"oci://ghcr.io/{REPOSITORY}/charts")
     chart_ref = f'ghcr.io/{REPOSITORY}/charts/vllm-stack:{state["chart_version"]}'
     manifest["chart"] = {"reference": "oci://" + chart_ref.rsplit(":", 1)[0],
@@ -435,7 +448,7 @@ def main():
     try:
         args.function(args)
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-        parser.exit(1, f"Release operation failed: {exc}\nNo published resources were deleted or overwritten.\n")
+        parser.exit(1, f"Release operation failed: {exc}\nPartial publication may remain; no cleanup was attempted.\n")
 
 
 if __name__ == "__main__":
