@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -387,10 +388,18 @@ def publish(args):
                 loader.wait()
                 raise
         image = f'ghcr.io/{REPOSITORY}/{package}:{state["image_tag"]}'
-        ensure_package_tag_absent(gh, f"vllm-production-stack/{package}", state["image_tag"])
-        run("docker", "push", image, timeout=1800)
-        manifest["images"][component] = {"reference": image, "digest": registry_digest(image), "archives": metadata["parts"]}
-        run("docker", "image", "rm", image)
+        try:
+            ensure_package_tag_absent(gh, f"vllm-production-stack/{package}", state["image_tag"])
+            run("docker", "push", image, timeout=1800)
+            manifest["images"][component] = {"reference": image, "digest": registry_digest(image), "archives": metadata["parts"]}
+        finally:
+            failure = sys.exc_info()[1]
+            try:
+                run("docker", "image", "rm", image)
+            except Exception as cleanup_error:
+                if failure is not None:
+                    raise RuntimeError(f"{failure}; loaded image cleanup failed: {cleanup_error}") from failure
+                raise
     ensure_package_tag_absent(gh, "vllm-production-stack/charts/vllm-stack", state["chart_version"])
     output = run("helm", "push", str(chart), f"oci://ghcr.io/{REPOSITORY}/charts")
     chart_ref = f'ghcr.io/{REPOSITORY}/charts/vllm-stack:{state["chart_version"]}'
