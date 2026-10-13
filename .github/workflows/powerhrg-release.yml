@@ -22,7 +22,7 @@ permissions: {}
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 10
     permissions:
       contents: read
@@ -55,7 +55,7 @@ jobs:
 
   images:
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 90
     permissions:
       contents: read
@@ -81,6 +81,11 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_sha }}
           path: source
           persist-credentials: false
+      - name: Inspect build tools and storage
+        run: |
+          docker info --format '{{.DockerRootDir}}'
+          docker buildx version
+          df -h "$RUNNER_TEMP"
       - name: Build once and export the image
         env:
           COMPONENT: ${{ matrix.component }}
@@ -111,7 +116,7 @@ jobs:
 
   chart:
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 20
     permissions:
       contents: read
@@ -147,7 +152,7 @@ jobs:
 
   publish:
     needs: [prepare, images, chart]
-    runs-on: ubuntu-24.04
+    runs-on: self-hosted
     timeout-minutes: 90
     permissions:
       contents: write
@@ -162,6 +167,10 @@ jobs:
           pattern: release-*
           path: ${{ runner.temp }}/packages
           merge-multiple: true
+      - name: Inspect publication storage
+        run: |
+          docker info --format '{{.DockerRootDir}}'
+          df -h "$RUNNER_TEMP"
       - name: Publish images, chart and release
         env:
           GH_TOKEN: ${{ github.token }}
