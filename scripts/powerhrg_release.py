@@ -199,9 +199,6 @@ def prepare(args):
     repo = gh.request(f"repos/{REPOSITORY}")
     if repo["full_name"].lower() != REPOSITORY:
         raise RuntimeError("repository identity mismatch")
-    pages = gh.request(f"repos/{REPOSITORY}/pages")
-    if pages["build_type"] != "workflow":
-        raise RuntimeError("enable GitHub Pages with GitHub Actions as its publishing source")
     run("git", "check-ref-format", "refs/heads/" + args.source_branch)
     source = gh.request(f"repos/{REPOSITORY}/git/ref/heads/{quote(args.source_branch)}")
     sha = source["object"]["sha"]
@@ -217,7 +214,7 @@ def prepare(args):
     state = {
         "format": FORMAT, "repository": REPOSITORY, "source_branch": args.source_branch,
         "source_sha": sha, "source_version": base, "release_tag": tag, "chart_version": version,
-        "image_tag": "v" + version, "pages_url": pages["html_url"],
+        "image_tag": "v" + version,
         "run_id": os.environ["GITHUB_RUN_ID"],
     }
     write_json(args.state, state)
@@ -316,49 +313,12 @@ def split_archive(args):
     })
 
 
-def previous_index(gh, releases, destination):
-    for release in sorted((r for r in releases if not r["draft"]),
-                          key=lambda r: r["published_at"], reverse=True):
-        assets = {a["name"]: a for a in release["assets"]}
-        if "release-manifest.json" not in assets:
-            continue
-        manifest = json.loads(gh.request(f"repos/{REPOSITORY}/releases/assets/{assets['release-manifest.json']['id']}", binary=True))
-        if manifest.get("format") != FORMAT:
-            continue
-        if manifest.get("repository") != REPOSITORY or "index.yaml" not in assets:
-            raise RuntimeError("prior workflow release has invalid repository/index metadata")
-        index = gh.request(f"repos/{REPOSITORY}/releases/assets/{assets['index.yaml']['id']}", binary=True)
-        if hashlib.sha256(index).hexdigest() != manifest["checksums"]["index.yaml"]:
-            raise RuntimeError("prior release index checksum mismatch")
-        destination.write_bytes(index)
-        return manifest
-    return False
-
-
 def registry_digest(image):
     raw = run("docker", "buildx", "imagetools", "inspect", image, "--format", "{{json .Manifest}}")
     value = json.loads(raw)["digest"]
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise RuntimeError("invalid registry digest")
     return value
-
-
-def check_pages_current(args):
-    gh, state = GitHub(), read_json(args.state)
-    releases = gh.pages(f"repos/{REPOSITORY}/releases")
-    for release in releases:
-        release["assets"] = gh.pages(f"repos/{REPOSITORY}/releases/{release['id']}/assets")
-    previous = Path(args.destination)
-    latest = previous_index(gh, releases, previous)
-    if not latest:
-        raise RuntimeError("no published workflow release exists")
-    # previous_index chooses the newest published manifest and authenticates its
-    # index. Its contents must match this run's index before any Pages deployment.
-    current = Path(args.index)
-    if (latest["release_tag"] != state["release_tag"]
-            or latest["source_sha"] != state["source_sha"]
-            or previous.read_bytes() != current.read_bytes()):
-        raise RuntimeError("stale Pages run: a newer published release owns the cumulative index")
 
 
 def publish(args):
@@ -378,14 +338,6 @@ def publish(args):
     chart = directory / f'vllm-stack-{state["chart_version"]}.tgz'
     if not chart.is_file():
         raise RuntimeError("chart package missing")
-    prior = directory / "previous-index.yaml"
-    merge = ["--merge", str(prior)] if previous_index(gh, releases, prior) else []
-    chart_index = directory / "chart-index"
-    chart_index.mkdir()
-    shutil.copyfile(chart, chart_index / chart.name)
-    url = f'https://github.com/{REPOSITORY}/releases/download/{quote(state["release_tag"])}'
-    run("helm", "repo", "index", str(chart_index), "--url", url, *merge)
-    shutil.copyfile(chart_index / "index.yaml", directory / "index.yaml")
     # Atomic ref creation is the final protection against other tag writers.
     gh.request(f"repos/{REPOSITORY}/git/refs", data={
         "ref": "refs/tags/" + state["release_tag"], "sha": state["source_sha"],
@@ -418,9 +370,10 @@ def publish(args):
     chart_ref = f'ghcr.io/{REPOSITORY}/charts/vllm-stack:{state["chart_version"]}'
     manifest["chart"] = {"reference": "oci://" + chart_ref.rsplit(":", 1)[0],
                           "digest": registry_digest(chart_ref), "archive": chart.name}
+    verify_oci_chart(manifest["chart"]["reference"], state["chart_version"], chart, directory / "verified-chart")
     # Helm writes its progress to stderr; registry readback supplies the digest.
     print(output, end="")
-    assets = [chart, directory / "index.yaml"]
+    assets = [chart]
     for metadata in (read_json(directory / "router.json"), read_json(directory / "operator.json")):
         assets.extend(directory / name for name in metadata["parts"])
     manifest["checksums"] = {path.name: digest(path) for path in assets}
@@ -441,46 +394,18 @@ def publish(args):
     notes = (f'Source: `{state["source_branch"]}` at `{state["source_sha"]}`.\n\n'
              f'Chart version: `{state["chart_version"]}`.\n\n'
              + "\n".join(f'- `{image["reference"]}@{image["digest"]}`' for image in manifest["images"].values())
-             + f'\n\nHelm HTTPS repository: {state["pages_url"]}\n'
              + f'\nOCI chart: `{manifest["chart"]["reference"]}` (use `--version {state["chart_version"]}`).\n'
              + '\nCheck SHA256SUMS before loading archives. For split archives, concatenate .partNNN files in numeric order, then pass the stream to docker load.\n')
     gh.request(f'repos/{REPOSITORY}/releases/{release["id"]}', data={"draft": False, "body": notes, "make_latest": "false"}, method="PATCH")
-    site = Path(args.site)
-    site.mkdir()
-    shutil.copyfile(directory / "index.yaml", site / "index.yaml")
-    write_json(site / "release-manifest.json", manifest)
-    print("Release published. HTTPS repository publication still requires the Pages job.")
+    print("Release and GHCR OCI chart published and verified.")
 
 
-def verify_pages(args):
-    state = read_json(args.state)
-    url = args.url.rstrip("/")
-    import time
-
-    for attempt in range(12):
-        try:
-            with urllib.request.urlopen(url + "/release-manifest.json", timeout=30) as response:
-                manifest = json.load(response)
-            if manifest["source_sha"] == state["source_sha"] and manifest["release_tag"] == state["release_tag"]:
-                with urllib.request.urlopen(url + "/index.yaml", timeout=30) as response:
-                    if hashlib.sha256(response.read()).hexdigest() == manifest["checksums"]["index.yaml"]:
-                        break
-        except (urllib.error.URLError, KeyError, ValueError):
-            pass
-        if attempt == 11:
-            raise RuntimeError("Pages publication readback did not match this release")
-        time.sleep(10)
-    run("helm", "repo", "add", "powerhrg", url)
-    destination = Path(args.destination)
+def verify_oci_chart(reference, version, archive, destination):
     destination.mkdir()
-    run("helm", "pull", "powerhrg/vllm-stack", "--version", state["chart_version"], "--destination", str(destination))
-    archive = destination / manifest["chart"]["archive"]
-    if digest(archive) != manifest["checksums"][archive.name]:
-        raise RuntimeError("HTTPS chart checksum mismatch")
-    run("helm", "pull", manifest["chart"]["reference"], "--version", state["chart_version"], "--destination", str(destination))
-    if digest(archive) != manifest["checksums"][archive.name]:
+    run("helm", "pull", reference, "--version", version, "--destination", str(destination))
+    if digest(destination / archive.name) != digest(archive):
         raise RuntimeError("OCI chart checksum mismatch")
-    print("Pages, HTTPS chart, and OCI chart verified against this release.")
+
 
 
 def main():
@@ -503,17 +428,9 @@ def main():
     cmd.add_argument("--component", choices=("router", "operator"), required=True)
     cmd.set_defaults(function=split_archive)
     cmd = commands.add_parser("publish")
-    for name in ("state", "packages", "site"):
+    for name in ("state", "packages"):
         cmd.add_argument("--" + name, required=True)
     cmd.set_defaults(function=publish)
-    cmd = commands.add_parser("verify-pages")
-    for name in ("state", "url", "destination"):
-        cmd.add_argument("--" + name, required=True)
-    cmd.set_defaults(function=verify_pages)
-    cmd = commands.add_parser("check-pages-current")
-    for name in ("state", "index", "destination"):
-        cmd.add_argument("--" + name, required=True)
-    cmd.set_defaults(function=check_pages_current)
     args = parser.parse_args()
     try:
         args.function(args)

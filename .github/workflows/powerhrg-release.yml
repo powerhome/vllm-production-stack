@@ -27,7 +27,6 @@ jobs:
     permissions:
       contents: read
       packages: read
-      pages: read
     outputs:
       source_sha: ${{ steps.prepare.outputs.source_sha }}
       source_version: ${{ steps.prepare.outputs.source_version }}
@@ -173,60 +172,4 @@ jobs:
           printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           python3 scripts/powerhrg_release.py publish \
             --state "$RUNNER_TEMP/packages/release-state.json" \
-            --packages "$RUNNER_TEMP/packages" --site "$RUNNER_TEMP/site"
-          tar --directory "$RUNNER_TEMP/site" -cf "$RUNNER_TEMP/artifact.tar" .
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: github-pages
-          path: ${{ runner.temp }}/artifact.tar
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: error
-
-  pages:
-    needs: publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-state
-          path: ${{ runner.temp }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: github-pages
-          path: ${{ runner.temp }}/pages
-      - name: Reject stale Pages reruns
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tar --extract --file "$RUNNER_TEMP/pages/artifact.tar" --directory "$RUNNER_TEMP/pages" ./index.yaml
-          python3 scripts/powerhrg_release.py check-pages-current \
-            --state "$RUNNER_TEMP/release-state.json" --index "$RUNNER_TEMP/pages/index.yaml" \
-            --destination "$RUNNER_TEMP/latest-index.yaml"
-      - name: Deploy Helm repository
-        id: deploy
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
-      - name: Verify published Helm repositories
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
-        run: |
-          python3 scripts/powerhrg_release.py install-helm --destination "$RUNNER_TEMP/bin"
-          export PATH="$RUNNER_TEMP/bin:$PATH"
-          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          python3 scripts/powerhrg_release.py verify-pages \
-            --state "$RUNNER_TEMP/release-state.json" --url "$PAGE_URL" \
-            --destination "$RUNNER_TEMP/verified"
+            --packages "$RUNNER_TEMP/packages"

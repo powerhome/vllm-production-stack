@@ -2,9 +2,8 @@
 
 Run **Release downstream vLLM stack** from Actions on `powerhrg`. The workflow
 builds the Python router, operator and chart from one frozen source commit.
-Before the first run, enable **Settings → Pages → Build and deployment → Source:
-GitHub Actions**. Allow the workflow ref in the `github-pages` environment and
-allow Actions to publish organization packages. Existing GHCR packages must
+The chart is published as a Helm OCI artifact on GHCR, alongside the images.
+Allow Actions to publish organization packages. Existing GHCR packages must
 grant this repository Actions access. New GHCR packages are private by default;
 change their visibility to public if unauthenticated image/OCI pulls are wanted.
 These settings are not changed by the workflow.
@@ -35,21 +34,15 @@ with that same tag. Upstream vLLM defaults are preserved. Both images support
 
 ## Install the chart
 
-Use the Pages URL reported in the run and release notes:
-
 ```sh
-helm repo add powerhrg https://powerhome.github.io/vllm-production-stack/
-helm repo update powerhrg
-helm install stack powerhrg/vllm-stack --version 0.1.13-powerhrg-7 -f values.yaml
-
 # Authenticate to GHCR first if the OCI package is private.
 helm install stack oci://ghcr.io/powerhome/vllm-production-stack/charts/vllm-stack \
   --version 0.1.13-powerhrg-7 -f values.yaml
 ```
 
 Always specify the chart version: `-powerhrg-N` is a SemVer prerelease suffix.
-The HTTPS index retains older chart versions and downloads packages from their
-GitHub Releases. The release manifest records source SHA, image/chart digests,
+The release also attaches the packaged chart. The manifest records source SHA,
+image/chart digests,
 archive ordering and checksums; `SHA256SUMS` also covers the manifest.
 
 ## Load downloaded images
@@ -64,13 +57,12 @@ cat router-v0.1.13-powerhrg-7.tar.gz.part[0-9][0-9][0-9] | docker load
 # For an unsplit router archive, use docker load --input instead.
 ```
 
-Publication spans GHCR, GitHub Releases and Pages. A failure after tag creation
-retains its partial publication and fails the run; it never overwrites or deletes
+Publication spans GHCR and GitHub Releases. A failure after tag creation retains
+its partial publication and fails the run; it never overwrites or deletes
 published resources. Inspect the failed run and reserved draft before choosing
-a new version. A failed Pages job can be rerun after correcting Pages settings;
-the already published release remains usable. Earlier publication failures need
-manual assessment rather than blindly rerunning the publish job.
-An older Pages rerun is rejected if a newer release owns the cumulative index.
+a new version. Publication failures need manual assessment rather than blindly
+rerunning the publish job. The workflow pulls the published OCI chart and checks
+its archive checksum before making the release public.
 
 Release dependencies are verified against
 `scripts/powerhrg_chart_dependencies.json`, whose hashes are the OCI chart-content
