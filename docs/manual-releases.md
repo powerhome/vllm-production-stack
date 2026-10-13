@@ -37,11 +37,9 @@ with that same tag. Upstream vLLM defaults are preserved. Both images support
 LMCache-backed `kvaware`/`loadaware` and experimental semantic caching, along with
 their vLLM, PyTorch and CUDA dependencies. Upstream build recipes and dependency
 definitions remain available for deployments requiring those optional features.
-The workflow uses `self-hosted` runners. They need Linux x86-64, Python 3.11 or
-newer, Docker with Buildx, gzip, and enough storage for the installed image plus
-its exported archive. Build and
-publication jobs report available archive storage and the Docker storage path.
-The workflow does not remove preinstalled SDKs or alter runner configuration.
+The workflow uses GitHub-hosted `ubuntu-24.04` runners. Build and publication
+jobs report available archive storage and the Docker storage path. The workflow
+does not remove preinstalled SDKs or alter runner configuration.
 Publication uses private job-scoped Docker/Helm registry configurations under
 `RUNNER_TEMP` and removes them even when publication fails.
 Image jobs use a digest-pinned builder with at most two parallel build steps.
