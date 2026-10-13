@@ -64,7 +64,7 @@ class GitHub:
         body = None if data is None else json.dumps(data).encode()
         if body is not None:
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request("https://api.github.com/" + path, body, headers, method)
+        req = urllib.request.Request("https://api.github.com/" + path, body, headers, method=method)
         try:
             with self.opener.open(req, timeout=60) as response:
                 payload = response.read(16 * 1024 * 1024 + 1)
