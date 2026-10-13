@@ -38,6 +38,9 @@ publication jobs report available archive storage and the Docker storage path.
 The workflow does not remove preinstalled SDKs or alter runner configuration.
 Publication uses private job-scoped Docker/Helm registry configurations under
 `RUNNER_TEMP` and removes them even when publication fails.
+Image jobs use a digest-pinned builder with at most two parallel build steps.
+After artifact upload, an always-run cleanup removes only that run's loaded
+image and dedicated builder/cache; it does not prune shared Docker caches.
 
 ## Install the chart
 

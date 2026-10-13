@@ -97,13 +97,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/packages"
-          docker buildx build --builder default --platform linux/amd64 --load \
+          BUILDER="release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$COMPONENT"
+          cat > "$RUNNER_TEMP/$BUILDER.toml" <<'TOML'
+          [worker.oci]
+          max-parallelism = 2
+          TOML
+          docker buildx create --name "$BUILDER" --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c \
+            --buildkitd-config "$RUNNER_TEMP/$BUILDER.toml"
+          touch "$RUNNER_TEMP/$BUILDER.created"
+          docker buildx build --builder "$BUILDER" --platform linux/amd64 --load \
             --file "tooling/docker/Dockerfile.$COMPONENT-release" \
             --build-arg "SOURCE_VERSION=$SOURCE_VERSION" \
             --label org.opencontainers.image.source=https://github.com/powerhome/vllm-production-stack \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --label "org.opencontainers.image.version=$IMAGE_TAG" \
             --tag "$IMAGE" "$CONTEXT"
+          touch "$RUNNER_TEMP/$BUILDER.loaded"
           docker save "$IMAGE" | gzip -1 > "$RUNNER_TEMP/packages/$COMPONENT-$IMAGE_TAG.tar.gz"
           python3 tooling/scripts/powerhrg_release.py split-archive \
             --component "$COMPONENT" --archive "$RUNNER_TEMP/packages/$COMPONENT-$IMAGE_TAG.tar.gz"
@@ -114,6 +124,21 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+      - name: Remove this run's image and builder cache
+        if: always()
+        env:
+          COMPONENT: ${{ matrix.component }}
+          IMAGE: ghcr.io/powerhome/vllm-production-stack/${{ matrix.package }}:${{ needs.prepare.outputs.image_tag }}
+        run: |
+          BUILDER="release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$COMPONENT"
+          cleanup_failed=0
+          if [ -f "$RUNNER_TEMP/$BUILDER.loaded" ]; then
+            docker image rm "$IMAGE" || cleanup_failed=1
+          fi
+          if [ -f "$RUNNER_TEMP/$BUILDER.created" ]; then
+            docker buildx rm "$BUILDER" || cleanup_failed=1
+          fi
+          exit "$cleanup_failed"
 
   chart:
     needs: prepare
