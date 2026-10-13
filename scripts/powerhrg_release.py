@@ -258,11 +258,24 @@ def stage_chart(args):
     if not match:
         raise RuntimeError("source routerSpec structure is unsupported")
     body = match[1]
-    for key, value in {"repository": f"ghcr.io/{REPOSITORY}/router", "tag": state["image_tag"]}.items():
+    router_defaults = {"repository": f"ghcr.io/{REPOSITORY}/router", "tag": state["image_tag"]}
+    for key, value in router_defaults.items():
         body, count = re.subn(r"^  " + key + r":[^\n]*", f"  {key}: {json.dumps(value)}", body, flags=re.MULTILINE)
         if count != 1:
             raise RuntimeError(f"expected one routerSpec.{key}")
     (target / "values.yaml").write_text(original[:match.start(1)] + body + original[match.end(1):])
+    readme = target / "README.md"
+    if readme.is_file():
+        text = readme.read_text()
+        for key, value in router_defaults.items():
+            pattern = r"^(\| `routerSpec\." + key + r"` \|[^|]*\| )[^|]*(\|.*)$"
+            text, count = re.subn(
+                pattern, lambda row: row[1] + "`" + json.dumps(value) + "` " + row[2],
+                text, flags=re.MULTILINE,
+            )
+            if count != 1:
+                raise RuntimeError(f"expected one README routerSpec.{key} row")
+        readme.write_text(text)
     run("helm", "dependency", "build", str(target), "--skip-refresh")
     verify_dependencies(target)
     run("helm", "lint", str(target))
