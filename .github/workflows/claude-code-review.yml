@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
     # Optional: Only run on specific file changes
     # paths:
     #   - "src/**/*.ts"
@@ -36,14 +36,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Checkout Claude plugins
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: anthropics/claude-code
-          ref: e47cc82bdbd27b5f799acd5b05fd0c29d33bb48c
-          path: .claude-plugins
-          persist-credentials: false
-
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@781d62e9d5fbd78b24dcdfd42858332d485fe462 # v1.0.212
@@ -52,7 +44,7 @@ jobs:
           track_progress: true
           use_sticky_comment: true
           allowed_bots: "renovate[bot],dependabot[bot],Copilot,copilot-swe-agent[bot]"
-          plugin_marketplaces: './.claude-plugins'
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
 
