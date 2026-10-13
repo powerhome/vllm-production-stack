@@ -157,7 +157,7 @@ def select_version(base, tags, releases, package_tags=(), override=""):
             if existing == version:
                 raise RuntimeError("normalized chart/image version already exists")
         return override, version
-    pattern = re.compile(re.escape(base) + r"-powerhrg-([1-9][0-9]*)")
+    pattern = re.compile(re.escape(base) + r"-powerhrg-([0-9]+)")
     numbers = []
     for item in used:
         try:
