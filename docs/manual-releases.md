@@ -36,6 +36,8 @@ newer, Docker with Buildx, gzip, and enough storage for the installed image plus
 its exported archive (allow at least 32 GiB free for the router build). Build and
 publication jobs report available archive storage and the Docker storage path.
 The workflow does not remove preinstalled SDKs or alter runner configuration.
+Publication uses private job-scoped Docker/Helm registry configurations under
+`RUNNER_TEMP` and removes them even when publication fails.
 
 ## Install the chart
 

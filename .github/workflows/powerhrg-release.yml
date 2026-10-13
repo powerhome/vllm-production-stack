@@ -175,7 +175,11 @@ jobs:
       - name: Publish images, chart and release
         env:
           GH_TOKEN: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/release-registry-${{ github.run_id }}-${{ github.run_attempt }}/docker
+          HELM_REGISTRY_CONFIG: ${{ runner.temp }}/release-registry-${{ github.run_id }}-${{ github.run_attempt }}/helm/config.json
         run: |
+          umask 077
+          mkdir -p "$DOCKER_CONFIG" "$(dirname "$HELM_REGISTRY_CONFIG")"
           python3 scripts/powerhrg_release.py install-helm --destination "$RUNNER_TEMP/bin"
           export PATH="$RUNNER_TEMP/bin:$PATH"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -183,3 +187,18 @@ jobs:
           python3 scripts/powerhrg_release.py publish \
             --state "$RUNNER_TEMP/packages/release-state.json" \
             --packages "$RUNNER_TEMP/packages"
+      - name: Remove job-scoped registry credentials
+        if: always()
+        env:
+          REGISTRY_AUTH_DIR: ${{ runner.temp }}/release-registry-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+          path = Path(os.environ['REGISTRY_AUTH_DIR']).resolve()
+          if path.parent != Path(os.environ['RUNNER_TEMP']).resolve():
+              raise RuntimeError('registry configuration must be inside RUNNER_TEMP')
+          if path.exists():
+              shutil.rmtree(path)
+          PY
