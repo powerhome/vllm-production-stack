@@ -95,6 +95,7 @@ jobs:
           SOURCE_VERSION: ${{ needs.prepare.outputs.source_version }}
           IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/packages"
           docker buildx build --builder default --platform linux/amd64 --load \
             --file "tooling/docker/Dockerfile.$COMPONENT-release" \
