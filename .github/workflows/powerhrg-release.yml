@@ -25,7 +25,8 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     permissions:
-      contents: read
+      # Draft release listings require push access, even though preparation only reads.
+      contents: write
       packages: read
     outputs:
       source_sha: ${{ steps.prepare.outputs.source_sha }}
