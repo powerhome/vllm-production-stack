@@ -180,12 +180,71 @@ def inventory(gh):
     package_tags = set()
     names = {"vllm-production-stack/router", "vllm-production-stack/production-stack-operator",
              "vllm-production-stack/charts/vllm-stack"}
-    # A successful authenticated listing is required even for first publication.
-    for package in gh.pages("orgs/powerhome/packages?package_type=container"):
-        if package["name"] in names:
-            for version in gh.pages("orgs/powerhome/packages/container/" + quote(package["name"]) + "/versions"):
-                package_tags.update(version["metadata"]["container"]["tags"])
+    for name in names:
+        package_tags.update(registry_tags(name))
     return tags, releases, package_tags
+
+
+class RegistryRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("unexpected GHCR redirect")
+
+
+def registry_tags(package_name):
+    # Use registry authentication supported by GITHUB_TOKEN, rather than the
+    # organization-wide Packages REST listing, which rejects workflow tokens.
+    name = REPOSITORY.split("/", 1)[0] + "/" + package_name
+    credential = os.environ["GH_TOKEN"]
+    actor = os.environ.get("GITHUB_ACTOR", "token")
+    basic = base64.b64encode(f"{actor}:{credential}".encode()).decode()
+    opener = urllib.request.build_opener(RegistryRedirect())
+
+    def request(path, authorization, *, allow_missing=False):
+        req = urllib.request.Request("https://ghcr.io" + path, headers={
+            "Authorization": authorization, "User-Agent": FORMAT,
+        })
+        try:
+            with opener.open(req, timeout=60) as response:
+                payload = response.read(16 * 1024 * 1024 + 1)
+                link = response.headers.get("Link")
+        except urllib.error.HTTPError as exc:
+            if allow_missing and exc.code == 404:
+                error = json.loads(exc.read(4096))
+                errors = error.get("errors", [])
+                if errors and all(item.get("code") == "NAME_UNKNOWN" for item in errors):
+                    return None, None
+            raise RuntimeError(f"GHCR {path}: HTTP {exc.code}; no absence inferred") from exc
+        if len(payload) > 16 * 1024 * 1024:
+            raise RuntimeError("GHCR response exceeds size bound")
+        return json.loads(payload), link
+
+    query = urllib.parse.urlencode({"service": "ghcr.io", "scope": f"repository:{name}:pull"})
+    token, _ = request("/token?" + query, "Basic " + basic)
+    if not isinstance(token, dict) or not isinstance(token.get("token"), str) or not token["token"]:
+        raise RuntimeError("invalid GHCR authentication response")
+    authorization = "Bearer " + token["token"]
+    path = f"/v2/{name}/tags/list?n=100"
+    tags = set()
+    for _ in range(100):
+        result, link = request(path, authorization, allow_missing=True)
+        if result is None:
+            return tags
+        if (not isinstance(result, dict) or result.get("name") != name
+                or not isinstance(result.get("tags"), list)
+                or not all(isinstance(tag, str) for tag in result["tags"])):
+            raise RuntimeError("invalid GHCR tag listing")
+        tags.update(result["tags"])
+        if not link:
+            return tags
+        match = re.fullmatch(r'<([^>]+)>;\s*rel="next"', link)
+        if not match:
+            raise RuntimeError("invalid GHCR pagination link")
+        following = urllib.parse.urlsplit(urllib.parse.urljoin("https://ghcr.io" + path, match[1]))
+        if (following.scheme != "https" or following.netloc != "ghcr.io"
+                or following.path != f"/v2/{name}/tags/list" or following.fragment):
+            raise RuntimeError("unexpected GHCR pagination target")
+        path = following.path + "?" + following.query
+    raise RuntimeError("GHCR pagination exceeds 100 pages")
 
 
 def scalar(text, name):
@@ -338,12 +397,8 @@ def registry_digest(image):
 def ensure_package_tag_absent(gh, package_name, tag):
     # GHCR tags are mutable. This workflow exclusively owns its release
     # namespace; recheck after slow archive loading, just before each push.
-    for package in gh.pages("orgs/powerhome/packages?package_type=container"):
-        if package["name"] != package_name:
-            continue
-        for version in gh.pages("orgs/powerhome/packages/container/" + quote(package_name) + "/versions"):
-            if tag in version["metadata"]["container"]["tags"]:
-                raise RuntimeError(f"package tag already exists: {package_name}:{tag}")
+    if tag in registry_tags(package_name):
+        raise RuntimeError(f"package tag already exists: {package_name}:{tag}")
 
 
 def publish(args):
