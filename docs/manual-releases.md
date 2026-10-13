@@ -30,10 +30,13 @@ The chart defaults to
 `ghcr.io/powerhome/vllm-production-stack/router:v<chart-version>`. The operator
 is published as `ghcr.io/powerhome/vllm-production-stack/production-stack-operator`
 with that same tag. Upstream vLLM defaults are preserved. Both images support
-`linux/amd64`; the router retains its semantic-cache and LMCache extras.
+`linux/amd64`. The router image includes core routing modes only; it excludes
+LMCache-backed `kvaware`/`loadaware` and experimental semantic caching, along with
+their vLLM, PyTorch and CUDA dependencies. Upstream build recipes and dependency
+definitions remain available for deployments requiring those optional features.
 The workflow uses `self-hosted` runners. They need Linux x86-64, Python 3.11 or
 newer, Docker with Buildx, gzip, and enough storage for the installed image plus
-its exported archive (allow at least 32 GiB free for the router build). Build and
+its exported archive. Build and
 publication jobs report available archive storage and the Docker storage path.
 The workflow does not remove preinstalled SDKs or alter runner configuration.
 Publication uses private job-scoped Docker/Helm registry configurations under
