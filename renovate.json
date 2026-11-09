@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>powerhome/renovate-config",
-    ":publication-age-containers"
+    "github>powerhome/renovate-config:publication-age-containers"
   ],
   "enabledManagers": [
     "dockerfile"
