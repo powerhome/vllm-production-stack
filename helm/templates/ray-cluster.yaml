@@ -146,6 +146,9 @@ spec:
                     name: {{ $.Values.servingEngineSpec.vllmApiKey.secretName }}
                     key: {{ $.Values.servingEngineSpec.vllmApiKey.secretKey }}
               {{- end }}
+              {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugEnv" . | nindent 14 }}
+              {{- end }}
               {{- with $modelSpec.env }}
               {{- toYaml . | nindent 14 }}
               {{- end }}
@@ -236,7 +239,7 @@ spec:
                 mountPath: /scripts
               - name: vllm-script
                 mountPath: /entrypoint
-              {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") $modelSpec.extraVolumeMounts }}
+              {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") $modelSpec.extraVolumeMounts (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
               {{- if hasKey $modelSpec "pvcStorage" }}
               - name: {{ .Release.Name }}-storage
                 mountPath: /data
@@ -251,6 +254,9 @@ spec:
               - name: vllm-templates
                 mountPath: /templates
               {{- end }}
+              {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumeMounts" . | nindent 14 }}
+              {{- end }}
               {{- with $modelSpec.extraVolumeMounts }}
               {{- toYaml . | nindent 14 }}
               {{- end }}
@@ -262,11 +268,11 @@ spec:
           - name: vllm-script
             configMap:
               name: "{{$modelSpec.name}}-vllm-start-script"
-          {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes }}
+          {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
           {{- if hasKey $modelSpec "pvcStorage" }}
           - name: {{ .Release.Name }}-storage
             persistentVolumeClaim:
-              claimName: "{{ .Release.Name }}-{{$modelSpec.name}}-storage-claim"
+              claimName: {{ $modelSpec.pvcExistingClaimName | default (printf "%s-%s-storage-claim" .Release.Name $modelSpec.name) | quote }}
           {{- end }}
           {{- with $modelSpec.vllmConfig }}
           {{- if hasKey $modelSpec.vllmConfig "tensorParallelSize"}}
@@ -290,6 +296,9 @@ spec:
           {{- with $modelSpec.extraVolumes }}
           {{- toYaml . | nindent 10 }}
           {{- end}}
+          {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumes" . | nindent 10 }}
+          {{- end }}
         {{- end}}
         {{- if $modelSpec.imagePullSecret }}
         imagePullSecrets:
@@ -447,6 +456,9 @@ spec:
                       name: {{ $.Values.servingEngineSpec.vllmApiKey.secretName }}
                       key: {{ $.Values.servingEngineSpec.vllmApiKey.secretKey }}
                 {{- end }}
+                {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugEnv" . | nindent 16 }}
+                {{- end }}
                 {{- with $modelSpec.env }}
                 {{- toYaml . | nindent 16 }}
                 {{- end }}
@@ -520,7 +532,7 @@ spec:
               {{- else }}
               resources: {{- include "chart.resources" $modelSpec | nindent 16 }}
               {{- end }}
-              {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") $modelSpec.extraVolumeMounts }}
+              {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") $modelSpec.extraVolumeMounts (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
               volumeMounts:
               {{- end }}
               {{- if hasKey $modelSpec "pvcStorage" }}
@@ -537,6 +549,9 @@ spec:
               - name: vllm-templates
                 mountPath: /templates
               {{- end }}
+              {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumeMounts" . | nindent 14 }}
+              {{- end }}
               {{- with $modelSpec.extraVolumeMounts }}
               {{- toYaml . | nindent 14 }}
               {{- end }}
@@ -547,11 +562,11 @@ spec:
             - name: vllm-script
               configMap:
                 name: "{{$modelSpec.name}}-vllm-start-script"
-            {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes }}
+            {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
             {{- if hasKey $modelSpec "pvcStorage" }}
             - name: {{ .Release.Name }}-storage
               persistentVolumeClaim:
-                claimName: "{{ .Release.Name }}-{{$modelSpec.name}}-storage-claim"
+                claimName: {{ $modelSpec.pvcExistingClaimName | default (printf "%s-%s-storage-claim" .Release.Name $modelSpec.name) | quote }}
             {{- end }}
             {{- with $modelSpec.vllmConfig }}
             {{- if hasKey $modelSpec.vllmConfig "tensorParallelSize"}}
@@ -575,6 +590,9 @@ spec:
             {{- with $modelSpec.extraVolumes }}
             {{- toYaml .| nindent 12 }}
             {{- end}}
+            {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumes" . | nindent 12 }}
+            {{- end }}
           {{- end}}
           {{- if $modelSpec.imagePullSecret }}
           imagePullSecrets:
@@ -728,10 +746,20 @@ data:
       {{- if hasKey . "maxLoras" }}
     ARGS+=("--max-loras" {{ .maxLoras | quote }})
       {{- end }}
-
       {{- range .extraArgs }}
+      {{- if not (and (hasKey $modelSpec "debug") $modelSpec.debug (hasPrefix "--disable-log-requests" .)) }}
     ARGS+=({{ . | quote }})
       {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+    ARGS+=("--enable-log-requests")
+    ARGS+=("--enable-log-outputs")
+    ARGS+=("--log-error-stack")
+    ARGS+=("--enable-logging-iteration-details")
+    ARGS+=("--middleware=vllm_http_debug.FullRequestLogger")
+    ARGS+=("--middleware=vllm_http_debug.FullResponseLogger")
+    ARGS+=("--max-log-len=10000")
     {{- end }}
     {{- if $modelSpec.modelRevision }}
     ARGS+=("--revision" {{ $modelSpec.modelRevision | quote }})

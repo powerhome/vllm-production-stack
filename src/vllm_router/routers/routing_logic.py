@@ -403,6 +403,8 @@ class KvawareRouter(RoutingInterface):
             # Remote /tokenize fallback (let errors bubble up to keep behavior simple)
             remote_url = endpoints[0].url + "/tokenize"
             headers = {"Content-Type": "application/json"}
+            if api_key := os.getenv("VLLM_API_KEY"):
+                headers["Authorization"] = f"Bearer {api_key}"
             data = {
                 "model": endpoints[0].model_names[0],
                 "prompt": request_json.get("prompt", ""),
@@ -697,6 +699,8 @@ class LoadAwareRouter(KvawareRouter):
         except Exception:
             remote_url = endpoints[0].url + "/tokenize"
             headers = {"Content-Type": "application/json"}
+            if api_key := os.getenv("VLLM_API_KEY"):
+                headers["Authorization"] = f"Bearer {api_key}"
             data = {
                 "model": endpoints[0].model_names[0],
                 "prompt": request_json.get("prompt", ""),
@@ -743,6 +747,8 @@ class LoadAwareRouter(KvawareRouter):
         """Tokenize a chat request through the engine's `/tokenize`."""
         remote_url = endpoints[0].url + "/tokenize"
         headers = {"Content-Type": "application/json"}
+        if api_key := os.getenv("VLLM_API_KEY"):
+            headers["Authorization"] = f"Bearer {api_key}"
         data = {
             "model": endpoints[0].model_names[0],
             "messages": self._flatten_text_content(request_json["messages"]),

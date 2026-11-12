@@ -10,6 +10,7 @@ servingEngineSpec:
 
   modelSpec:
   - name: "opt125m"
+    debug: false
     repository: "lmcache/vllm-openai"
     tag: "latest"
     modelURL: "facebook/opt-125m"
@@ -20,6 +21,7 @@ servingEngineSpec:
 
     requestCPU: 6
     requestMemory: "16Gi"
+    requestEphemeralStorage: "1Gi"
     requestGPU: 1
 
     pvcStorage: "10Gi"

@@ -79,6 +79,15 @@ func (r *VLLMRuntimeReconciler) Reconcile(
 		log.Error(err, "Failed to get VLLMRuntime")
 		return ctrl.Result{}, err
 	}
+	if shmSize := vllmRuntime.Spec.DeploymentConfig.ShmSize; shmSize != "" {
+		quantity, err := resource.ParseQuantity(shmSize)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("invalid shmSize %q: %w", shmSize, err)
+		}
+		if quantity.Sign() <= 0 {
+			return ctrl.Result{}, fmt.Errorf("invalid shmSize %q: must be positive", shmSize)
+		}
+	}
 
 	// Check if the service already exists, if not create a new one
 	foundService := &corev1.Service{}
@@ -745,16 +754,8 @@ func (r *VLLMRuntimeReconciler) deploymentForVLLMRuntime(
 		shmSource := corev1.VolumeSource{
 			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
 		}
-		if q, err := resource.ParseQuantity(vllmRuntime.Spec.DeploymentConfig.ShmSize); err == nil {
-			shmSource.EmptyDir.SizeLimit = &q
-		} else {
-			// Don't silently mount an unbounded /dev/shm on a typo: surface the
-			// bad value so the misconfiguration is visible instead of defaulting
-			// to the node's memory limit without any indication.
-			log.Log.Error(err, "Invalid shmSize; mounting /dev/shm without a size limit",
-				"vllmRuntime", vllmRuntime.Name,
-				"shmSize", vllmRuntime.Spec.DeploymentConfig.ShmSize)
-		}
+		q := resource.MustParse(vllmRuntime.Spec.DeploymentConfig.ShmSize)
+		shmSource.EmptyDir.SizeLimit = &q
 		volumes = append(volumes, corev1.Volume{Name: "dshm", VolumeSource: shmSource})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      "dshm",
@@ -799,6 +800,10 @@ func (r *VLLMRuntimeReconciler) deploymentForVLLMRuntime(
 	if vllmRuntime.Spec.DeploymentConfig.SidecarConfig.Enabled {
 		containers = append(containers, r.buildSidecarContainer(vllmRuntime))
 	}
+	var runtimeClassName *string
+	if vllmRuntime.Spec.DeploymentConfig.RuntimeClass != "" {
+		runtimeClassName = &vllmRuntime.Spec.DeploymentConfig.RuntimeClass
+	}
 
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -821,7 +826,7 @@ func (r *VLLMRuntimeReconciler) deploymentForVLLMRuntime(
 					Annotations: vllmRuntime.Spec.DeploymentConfig.PodAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					RuntimeClassName: &vllmRuntime.Spec.DeploymentConfig.RuntimeClass,
+					RuntimeClassName: runtimeClassName,
 					Affinity:         affinity,
 					Tolerations:      vllmRuntime.Spec.DeploymentConfig.Toleration,
 					ImagePullSecrets: imagePullSecrets,
@@ -1095,20 +1100,9 @@ func (r *VLLMRuntimeReconciler) deploymentNeedsUpdate(
 	expectedPodAnnotations := expectedDep.Spec.Template.Annotations
 	actualPodAnnotations := dep.Spec.Template.Annotations
 
-	for k, v := range expectedPodAnnotations {
-		if actualPodAnnotations[k] != v {
-			log.Info(
-				"Pod annotations mismatch",
-				"key",
-				k,
-				"expected",
-				v,
-				"actual",
-				actualPodAnnotations[k],
-			)
-
-			return true
-		}
+	if !maps.Equal(expectedPodAnnotations, actualPodAnnotations) {
+		log.Info("Pod annotations mismatch", "expected", expectedPodAnnotations, "actual", actualPodAnnotations)
+		return true
 	}
 
 	// Detect drift in the /dev/shm volume (driven by shmSize). We compare the

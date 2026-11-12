@@ -55,6 +55,7 @@ This table documents all available configuration values for the Production Stack
 | `servingEngineSpec.servicePort` | integer | `80` | Port the service will listen on |
 | `servingEngineSpec.configs` | map | `{}` | Set other environment variables from a config map |
 | `servingEngineSpec.strategy` | map | `{}` | Deployment strategy for the serving engine pods |
+| `servingEngineSpec.progressDeadlineSeconds` | integer | `1200` | Number of seconds a serving engine deployment may make no progress before Kubernetes marks it failed |
 | `servingEngineSpec.tolerations` | list | `[]` | Tolerations configuration for the serving engine pods (when there are taints on nodes) |
 | `servingEngineSpec.runtimeClassName` | string | `"nvidia"` | RuntimeClassName configuration (set to "nvidia" if using GPU) |
 | `servingEngineSpec.schedulerName` | string | `""` | SchedulerName configuration for the serving engine pods |
@@ -85,6 +86,7 @@ This table documents all available configuration values for the Production Stack
 | `servingEngineSpec.modelSpec[].labels` | map | `{}` | (Optional) Additional labels to add to the deployment |
 | `servingEngineSpec.modelSpec[].podLabels` | map | `{}` | (Optional) Additional labels to add to the pods |
 | `servingEngineSpec.modelSpec[].name` | string | `""` | The name of the model, e.g., "example-model" |
+| `servingEngineSpec.modelSpec[].debug` | boolean | `false` | Enable verbose vLLM arguments, debug environment variables, and middleware mounts; see the custom-command note below |
 | `servingEngineSpec.modelSpec[].repository` | string | `""` | The repository of the model, e.g., "vllm/vllm-openai" |
 | `servingEngineSpec.modelSpec[].tag` | string | `""` | The tag of the model, e.g., "latest" |
 | `servingEngineSpec.modelSpec[].imagePullSecret` | string | `""` | (Optional) Name of secret with credentials to private container repository |
@@ -121,9 +123,15 @@ This table documents all available configuration values for the Production Stack
 | `servingEngineSpec.modelSpec[].hf_token` | string/map | - | (Optional) Hugging Face token configuration |
 | `servingEngineSpec.modelSpec[].env` | list | - | (Optional) Environment variables for the container |
 | `servingEngineSpec.modelSpec[].nodeName` | string | - | (Optional) Direct node assignment |
+| `servingEngineSpec.modelSpec[].nodeSelector` | map | `{}` | (Optional) Node selector labels applied directly to the model pods |
 | `servingEngineSpec.modelSpec[].nodeSelectorTerms` | list | - | (Optional) Node selector terms |
 | `servingEngineSpec.modelSpec[].tolerations` | list | - | (Optional) Per-model tolerations. Merged with or replaces `servingEngineSpec.tolerations` according to `tolerationsPolicy` |
 | `servingEngineSpec.modelSpec[].tolerationsPolicy` | string | `"append"` | (Optional) How per-model tolerations interact with global tolerations. `"append"` unions both lists; `"override"` replaces global tolerations entirely for this model |
+
+When `modelSpec[].command` is set, the chart preserves that command exactly.
+With a custom command, `debug: true` still supplies the debug environment and
+middleware mount, but does not append startup flags. Add the desired debug and
+`--middleware` arguments explicitly through `command` or `args`.
 
 #### Init Container Configuration
 
@@ -144,7 +152,7 @@ This table documents all available configuration values for the Production Stack
 | `servingEngineSpec.modelSpec[].vllmConfig.v0` | integer | - | Specify to 1 to use vLLM v0, otherwise vLLM v1 |
 | `servingEngineSpec.modelSpec[].vllmConfig.enablePrefixCaching` | boolean | `false` | Enable prefix caching |
 | `servingEngineSpec.modelSpec[].vllmConfig.enableChunkedPrefill` | boolean | `false` | Enable chunked prefill |
-| `servingEngineSpec.modelSpec[].vllmConfig.maxModelLen` | integer | `4096` | The maximum model length, e.g., 16384 |
+| `servingEngineSpec.modelSpec[].vllmConfig.maxModelLen` | integer/string | `4096` | The maximum model length, e.g., 16384. Use a string to prevent large values from being serialized in scientific notation |
 | `servingEngineSpec.modelSpec[].vllmConfig.dtype` | string | `"fp16"` | The data type, e.g., "bfloat16" |
 | `servingEngineSpec.modelSpec[].vllmConfig.tensorParallelSize` | integer | `1` | The degree of tensor parallelism, e.g., 2 |
 | `servingEngineSpec.modelSpec[].vllmConfig.maxNumSeqs` | integer | `256` | Maximum number of sequences to be processed in a single iteration |
@@ -264,8 +272,8 @@ Set `servingEngineSpec.modelSpec[].raySpec.enabled: true` to deploy the model as
 | `routerSpec.k8sServiceDiscoveryType` | string | `"pod-ip"` | Service discovery Type ("pod-ip" or "service-name") if serviceDiscovery is "k8s" |
 | `routerSpec.staticBackends` | string | `""` | Comma-separated list of backend addresses if serviceDiscovery is "static" |
 | `routerSpec.staticModels` | string | `""` | Comma-separated list of model names if serviceDiscovery is "static" |
-| `routerSpec.routingLogic` | string | `"roundrobin"` | Routing logic: `"roundrobin"`, `"session"`, `"prefixaware"`, `"kvaware"`, `"disaggregated_prefill"`, or `"disaggregated_prefill_orchestrated"` |
-| `routerSpec.prefixMinMatchLength` | integer | `0` | Minimum prefix match length for `prefixaware` routing to reuse a matched endpoint; below this, requests fall back to QPS routing. Quantized to the prefix chunk size (default 128). `0` disables it |
+| `routerSpec.routingLogic` | string | `"roundrobin"` | Routing logic: `"roundrobin"`, `"session"`, `"prefixaware"`, `"kvaware"`, `"loadaware"`, `"priority"`, `"disaggregated_prefill"`, or `"disaggregated_prefill_orchestrated"` |
+| `routerSpec.prefixMinMatchLength` | integer | `0` | Minimum prefix match length for `prefixaware` routing to reuse a matched endpoint; below this, requests fall back to least-inflight routing. Quantized to the prefix chunk size (default 128). `0` disables it |
 | `routerSpec.sessionKey` | string | `""` | Session key if using "session" routing logic |
 | `routerSpec.extraArgs` | list | `[]` | Extra command line arguments to pass to the router |
 | `routerSpec.extraVolumes` | list | `[]` | Additional volumes to add to the router pod, in Kubernetes volume format |

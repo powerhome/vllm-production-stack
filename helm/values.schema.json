@@ -883,13 +883,15 @@
                     }
                 },
                 "routingLogic": {
-                    "description": "routing logic, supports \"roundrobin\", \"session\", \"prefixaware\", \"kvaware\", \"disaggregated_prefill\" or \"disaggregated_prefill_orchestrated\"",
+                    "description": "routing logic, supports \"roundrobin\", \"session\", \"prefixaware\", \"kvaware\", \"loadaware\", \"priority\", \"disaggregated_prefill\" or \"disaggregated_prefill_orchestrated\"",
                     "type": "string",
                     "enum": [
                         "roundrobin",
                         "session",
                         "prefixaware",
                         "kvaware",
+                        "loadaware",
+                        "priority",
                         "disaggregated_prefill",
                         "disaggregated_prefill_orchestrated"
                     ]
@@ -1137,6 +1139,11 @@
                                     "type": "string"
                                 }
                             },
+                            "debug": {
+                                "default": false,
+                                "description": "Enable verbose vLLM request/output debug args and full HTTP request/response logging middleware for this model only.",
+                                "type": "boolean"
+                            },
                             "enableLoRA": {
                                 "description": "Whether to enable LoRA",
                                 "type": "boolean"
@@ -1369,6 +1376,10 @@
                                     "string"
                                 ]
                             },
+                            "limitEphemeralStorage": {
+                                "description": "The ephemeral storage limit for the model",
+                                "type": "string"
+                            },
                             "limitGPUCores": {
                                 "description": "Requires HAMi. The limit of GPU cores. Each unit equals to 1% device cores. https://project-hami.io/docs/userguide/NVIDIA-device/specify-device-core-usage",
                                 "type": "string"
@@ -1427,6 +1438,10 @@
                             "nodeName": {
                                 "description": "Directly assigns a pod to a specific node (e.g., \"192.168.56.5\"). When both nodeName and nodeSelectorTerms are defined, the preference is given to nodeName.",
                                 "type": "string"
+                            },
+                            "nodeSelector": {
+                                "description": "Node selector labels applied directly to the model pods.",
+                                "type": "object"
                             },
                             "nodeSelectorTerms": {
                                 "description": "The node selector terms to match the nodes. When both affinity and nodeSelectorTerms are defined, nodeSelectorTerms will be ignored.",
@@ -1506,6 +1521,10 @@
                             "requestCPU": {
                                 "description": "The number of CPUs requested for the model",
                                 "type": "integer"
+                            },
+                            "requestEphemeralStorage": {
+                                "description": "The amount of ephemeral storage requested for the model",
+                                "type": "string"
                             },
                             "requestGPU": {
                                 "description": "The number of GPUs requested for the model",
@@ -1623,7 +1642,10 @@
                                     },
                                     "maxModelLen": {
                                         "description": "The maximum model length",
-                                        "type": "integer"
+                                        "type": [
+                                            "integer",
+                                            "string"
+                                        ]
                                     },
                                     "maxNumSeqs": {
                                         "description": "Maximum number of sequences to be processed in a single iteration.",
@@ -1788,6 +1810,11 @@
                             "type": "integer"
                         }
                     }
+                },
+                "progressDeadlineSeconds": {
+                    "description": "Number of seconds a serving engine deployment may make no progress before Kubernetes marks it failed",
+                    "type": "integer",
+                    "minimum": 1
                 },
                 "strategy": {
                     "description": "deployment strategy",

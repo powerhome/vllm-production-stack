@@ -25,6 +25,8 @@ from aiohttp import FormData
 from fastapi import BackgroundTasks, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from requests import JSONDecodeError
+from starlette.datastructures import FormData as RequestFormData
+from starlette.datastructures import UploadFile as RequestUploadFile
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
@@ -280,11 +282,9 @@ async def process_request(
     first_token = False
     total_len = 0
     start_time = time.time()
-    # Key the stats by this dispatch, not by request_id: clients can reuse an
-    # X-Request-Id for concurrent requests, which would then share one slot.
-    stats_id = str(uuid.uuid4())
+    stats_request_id = str(uuid.uuid4())
     request.app.state.request_stats_monitor.on_new_request(
-        backend_url, stats_id, start_time
+        backend_url, stats_request_id, start_time
     )
 
     model_name = "unknown"
@@ -346,7 +346,7 @@ async def process_request(
                 if not first_token:
                     first_token = True
                     request.app.state.request_stats_monitor.on_request_response(
-                        backend_url, stats_id, time.time()
+                        backend_url, stats_request_id, time.time()
                     )
                 # Collect the body only when a consumer needs it
                 if full_response is not None:
@@ -395,7 +395,7 @@ async def process_request(
         # In finally so backend-error and client-disconnect paths also release
         # the in-flight slot; on_request_complete is idempotent.
         request.app.state.request_stats_monitor.on_request_complete(
-            backend_url, stats_id, time.time()
+            backend_url, stats_request_id, time.time()
         )
         request_latency_seconds.labels(
             server=backend_url, model=model_name, status=request_status
@@ -779,12 +779,34 @@ async def route_orchestrated_disaggregated_request(
     in_router_time = time.time()
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_json = await request.json()
+    model = request_json.get("model")
+    if not model:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid request: missing 'model'."},
+            headers={"X-Request-Id": request_id},
+        )
+    backend_headers = _build_backend_request_headers(
+        request, request_id, include_content_type=False
+    )
+    backend_headers["Content-Type"] = "application/json"
+    if api_key := os.getenv("VLLM_API_KEY"):
+        backend_headers = {
+            key: value
+            for key, value in backend_headers.items()
+            if key.lower() != "authorization"
+        }
+        backend_headers["Authorization"] = f"Bearer {api_key}"
 
     logger.info(f"[{request_id}] Starting orchestrated disaggregated inference")
 
     # Get endpoints from service discovery
     service_discovery = get_service_discovery()
-    endpoints = service_discovery.get_endpoint_info()
+    endpoints = [
+        endpoint
+        for endpoint in service_discovery.get_endpoint_info()
+        if model in endpoint.model_names
+    ]
 
     # Use router's _find_endpoints method to get prefill and decode endpoints
     router = request.app.state.router
@@ -843,10 +865,7 @@ async def route_orchestrated_disaggregated_request(
         async with client.post(
             prefill_api_url,
             json=prefill_request_json,
-            headers={
-                "Content-Type": "application/json",
-                "X-Request-Id": request_id,
-            },
+            headers=backend_headers,
             timeout=aiohttp.ClientTimeout(total=300),
         ) as prefill_resp:
             if prefill_resp.status != 200:
@@ -889,10 +908,7 @@ async def route_orchestrated_disaggregated_request(
         decode_resp = await client.post(
             decode_api_url,
             json=decode_request,
-            headers={
-                "Content-Type": "application/json",
-                "X-Request-Id": request_id,
-            },
+            headers=backend_headers,
             timeout=aiohttp.ClientTimeout(total=600),
         )
         try:
@@ -1239,7 +1255,14 @@ async def route_general_transcriptions(
         form_data.add_field(key, value)
 
     return await proxy_multipart_request(
-        form_data, model, endpoint, request, stream=stream
+        form_data,
+        model,
+        endpoint,
+        request,
+        stream=stream,
+        request_fields={
+            key: value for key, value in form.multi_items() if isinstance(value, str)
+        },
     )
 
 
@@ -1262,7 +1285,16 @@ async def route_multipart_request(
 
     logger.debug("Routing multipart request with model %s", model)
 
-    return await proxy_multipart_request(body, model, endpoint, request)
+    return await proxy_multipart_request(
+        body,
+        model,
+        endpoint,
+        request,
+        request_fields={
+            key: value for key, value in form.multi_items() if isinstance(value, str)
+        },
+        request_form=form,
+    )
 
 
 async def proxy_multipart_request(
@@ -1272,8 +1304,11 @@ async def proxy_multipart_request(
     request: Request,
     *,
     stream: bool = False,
+    request_fields: dict[str, str] | None = None,
+    request_form: RequestFormData | None = None,
 ):
     request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    stats_request_id = str(uuid.uuid4())
 
     if not model:
         return JSONResponse(
@@ -1301,6 +1336,8 @@ async def proxy_multipart_request(
     # grab the current engine and request stats
     engine_stats = engine_stats_scraper.get_engine_stats()
     request_stats = request_stats_monitor.get_request_stats(time.time())
+    request_fields = dict(request_fields or {})
+    request_fields.setdefault("prompt", "")
 
     # pick one using the router's configured logic (roundrobin, least-loaded, etc.)
     if isinstance(
@@ -1309,6 +1346,7 @@ async def proxy_multipart_request(
             KvawareRouter,
             PrefixAwareRouter,
             SessionRouter,
+            PriorityRouter,
             DisaggregatedPrefillOrchestratedRouter,
         ),
     ):
@@ -1317,7 +1355,7 @@ async def proxy_multipart_request(
             engine_stats,
             request_stats,
             request,
-            {},  # no JSON body for multipart/form-data
+            request_fields,
         )
     elif isinstance(router, DisaggregatedPrefillRouter):
         chosen_url = router.route_request(
@@ -1325,7 +1363,7 @@ async def proxy_multipart_request(
             engine_stats,
             request_stats,
             request,
-            {},  # no JSON body for multipart/form-data
+            request_fields,
         )
     else:
         chosen_url = router.route_request(
@@ -1334,6 +1372,27 @@ async def proxy_multipart_request(
             request_stats,
             request,
         )
+    if isinstance(router, PriorityRouter):
+        priority_field = router.priority_field
+        priority = str(request_fields[priority_field])
+        if request_form is None:
+            form_data.add_field(priority_field, priority)
+        else:
+            forwarded_form = aiohttp.FormData()
+            for key, value in request_form.multi_items():
+                if key == priority_field:
+                    continue
+                if isinstance(value, RequestUploadFile):
+                    forwarded_form.add_field(
+                        key,
+                        await value.read(),
+                        filename=value.filename,
+                        content_type=value.content_type,
+                    )
+                else:
+                    forwarded_form.add_field(key, value)
+            forwarded_form.add_field(priority_field, priority)
+            form_data = forwarded_form
     logger.info(
         "Proxying multi-part form request for model %s to %s", model, chosen_url
     )
@@ -1346,8 +1405,7 @@ async def proxy_multipart_request(
             include_content_type=isinstance(form_data, bytes),
         )
 
-        stats_id = str(uuid.uuid4())  # see process_request
-        request_stats_monitor.on_new_request(chosen_url, stats_id, time.time())
+        request_stats_monitor.on_new_request(chosen_url, stats_request_id, time.time())
 
         try:
             backend_response = await client.post(
@@ -1357,7 +1415,9 @@ async def proxy_multipart_request(
                 timeout=aiohttp.ClientTimeout(total=300),
             )
         except Exception:
-            request_stats_monitor.on_request_complete(chosen_url, stats_id, time.time())
+            request_stats_monitor.on_request_complete(
+                chosen_url, stats_request_id, time.time()
+            )
             raise
 
         resp_headers = {
@@ -1376,14 +1436,14 @@ async def proxy_multipart_request(
                         if not first_token:
                             first_token = True
                             request_stats_monitor.on_request_response(
-                                chosen_url, stats_id, time.time()
+                                chosen_url, stats_request_id, time.time()
                             )
                         if chunk:
                             yield chunk
                 finally:
                     backend_response.close()
                     request_stats_monitor.on_request_complete(
-                        chosen_url, stats_id, time.time()
+                        chosen_url, stats_request_id, time.time()
                     )
 
             return StreamingResponse(
@@ -1396,7 +1456,9 @@ async def proxy_multipart_request(
             )
 
         try:
-            request_stats_monitor.on_request_response(chosen_url, stats_id, time.time())
+            request_stats_monitor.on_request_response(
+                chosen_url, stats_request_id, time.time()
+            )
             if not _is_json_media_type(
                 backend_response.headers.get("content-type", "")
             ):
@@ -1426,7 +1488,9 @@ async def proxy_multipart_request(
             )
         finally:
             backend_response.close()
-            request_stats_monitor.on_request_complete(chosen_url, stats_id, time.time())
+            request_stats_monitor.on_request_complete(
+                chosen_url, stats_request_id, time.time()
+            )
     except aiohttp.ClientResponseError as response_error:
         if response_error.response is not None:
             try:

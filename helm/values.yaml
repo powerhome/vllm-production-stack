@@ -25,6 +25,8 @@ servingEngineSpec:
   modelSpec:
   # -- The name of the model.
   - name: "mistral"
+    # -- Enable verbose vLLM request/output debug args and full HTTP request/response logging middleware for this model only.
+    debug: false
     # -- Whether to deploy the model. it Default to true if not set
     enabled: false
     # -- The annotations to add to the deployment
@@ -61,6 +63,8 @@ servingEngineSpec:
     requestCPU: 6
     # -- The amount of memory requested for the model
     requestMemory: "16Gi"
+    # -- The amount of ephemeral storage requested for the model
+    requestEphemeralStorage: "1Gi"
     # -- The number of GPUs requested for the model
     requestGPU: 1 # @schema type:[integer, number, string]
     # -- The type of GPU requested. If not specified, defaults to "nvidia.com/gpu"
@@ -75,6 +79,8 @@ servingEngineSpec:
     limitCPU: 8 # @schema type:[integer, number, string]
     # -- The memory limit for the model. If limitCPU and limitMemory are not specified, only GPU resources will have limits set equal to their requests.
     limitMemory: "32Gi"
+    # -- The ephemeral storage limit for the model
+    limitEphemeralStorage: "10Gi"
     # -- Requires HAMi. The limit of GPU memory. Each unit equals to 1M. https://project-hami.io/docs/userguide/NVIDIA-device/specify-device-memory-usage
     limitGPUMem: "3000"
     # -- Requires HAMi. The limit of GPU memory of GPU
@@ -214,6 +220,8 @@ servingEngineSpec:
     env: []
     # -- Affinity configuration
     affinity: {}
+    # -- Node selector labels applied directly to the model pods.
+    nodeSelector: {}
     # -- The node selector terms to match the nodes. When both affinity and nodeSelectorTerms are defined, nodeSelectorTerms will be ignored.
     nodeSelectorTerms: []
     # -- Directly assigns a pod to a specific node (e.g., "192.168.56.5"). When both nodeName and nodeSelectorTerms are defined, the preference is given to nodeName.
@@ -341,6 +349,9 @@ servingEngineSpec:
 
   # -- deployment strategy
   strategy: {}
+
+  # -- Number of seconds a serving engine deployment may make no progress before Kubernetes marks it failed
+  progressDeadlineSeconds: 1200
 
   # -- Readiness probe configuration
   startupProbe:
@@ -573,8 +584,8 @@ routerSpec:
   staticBackends: ""
   staticModels: ""
 
-  # -- routing logic, supports "roundrobin", "session", "prefixaware", "kvaware", "disaggregated_prefill" or "disaggregated_prefill_orchestrated"
-  routingLogic: "roundrobin" # @schema enum:[roundrobin,session,prefixaware,kvaware,disaggregated_prefill,disaggregated_prefill_orchestrated]
+  # -- routing logic, supports "roundrobin", "session", "prefixaware", "kvaware", "loadaware", "priority", "disaggregated_prefill" or "disaggregated_prefill_orchestrated"
+  routingLogic: "roundrobin" # @schema enum:[roundrobin,session,prefixaware,kvaware,loadaware,priority,disaggregated_prefill,disaggregated_prefill_orchestrated]
 
   # -- Minimum prefix match length required for prefixaware routing to reuse a
   # matched endpoint. If the longest prefix match is shorter than this value,

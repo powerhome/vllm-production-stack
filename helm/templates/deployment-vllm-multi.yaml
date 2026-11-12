@@ -40,7 +40,7 @@ spec:
       helm-release-name: {{ .Release.Name }}
     {{- include "chart.engineStandardLabels" (dict "releaseName" .Release.Name "modelName" $modelSpec.name "chartName" .Chart.Name) | nindent 6 }}
     {{- include "chart.engineLabels" . | nindent 6 }}
-  progressDeadlineSeconds: 1200
+  progressDeadlineSeconds: {{ .Values.servingEngineSpec.progressDeadlineSeconds }}
   template:
     metadata:
       {{- with $modelSpec.podAnnotations }}
@@ -48,13 +48,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        model: {{ $modelSpec.name }}
-        helm-release-name: {{ .Release.Name }}
-      {{- include "chart.engineStandardLabels" (dict "releaseName" .Release.Name "modelName" $modelSpec.name "chartName" .Chart.Name) | nindent 8 }}
-      {{- include "chart.engineLabels" . | nindent 8 }}
-      {{- with $modelSpec.podLabels }}
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- $standardLabels := include "chart.engineStandardLabels" (dict "releaseName" .Release.Name "modelName" $modelSpec.name "chartName" .Chart.Name) | fromYaml }}
+        {{- $podLabels := mergeOverwrite (dict) ($modelSpec.podLabels | default dict) (dict "model" $modelSpec.name "helm-release-name" .Release.Name) $standardLabels (.Values.servingEngineSpec.labels | default dict) }}
+        {{- toYaml $podLabels | nindent 8 }}
     spec:
       {{- if $modelSpec.priorityClassName }}
       priorityClassName: {{ $modelSpec.priorityClassName | quote }}
@@ -195,10 +191,16 @@ spec:
           - {{ .convert | quote }}
           {{-   end }}
           {{-   if .extraArgs }}
+          {{-     $debugEnabled := and (hasKey $modelSpec "debug") $modelSpec.debug }}
           {{-     range .extraArgs }}
+          {{-       if not (and $debugEnabled (hasPrefix "--disable-log-requests" .)) }}
           - {{ . | quote }}
+          {{-       end }}
           {{-     end }}
           {{-   end }}
+          {{- end }}
+          {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugArgs" . | nindent 10 }}
           {{- end }}
           {{- if $modelSpec.modelRevision }}
           - "--revision"
@@ -284,6 +286,9 @@ spec:
           {{- end }}
           {{- with .Values.servingEngineSpec.env }}
           {{- toYaml . | nindent 10 }}
+          {{- end }}
+          {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugEnv" . | nindent 10 }}
           {{- end }}
           {{- with $modelSpec.env }}
           {{- toYaml . | nindent 10 }}
@@ -422,7 +427,7 @@ spec:
           {{- else }}
           resources: {{- include "chart.resources" $modelSpec | nindent 12 }}
           {{- end }}
-          {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") }}
+          {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumeMounts") (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
           volumeMounts:
           {{- end }}
           {{- if hasKey $modelSpec "pvcStorage" }}
@@ -443,6 +448,9 @@ spec:
           - name: vllm-templates
             mountPath: /templates
           {{- end }}
+          {{- end }}
+          {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumeMounts" . | nindent 10 }}
           {{- end }}
           {{- with $modelSpec.extraVolumeMounts }}
           {{- toYaml . | nindent 10 }}
@@ -471,7 +479,7 @@ spec:
       imagePullSecrets:
         - name: {{ $modelSpec.imagePullSecret }}
       {{- end }}
-      {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes $.Values.sharedPvcStorage.enabled }}
+      {{- if or (hasKey $modelSpec "pvcStorage") (and $modelSpec.vllmConfig (hasKey $modelSpec.vllmConfig "tensorParallelSize")) (hasKey $modelSpec "chatTemplate") (hasKey $modelSpec "extraVolumes") $modelSpec.extraVolumes $.Values.sharedPvcStorage.enabled (and (hasKey $modelSpec "debug") $modelSpec.debug) }}
       volumes:
       {{- end}}
         {{- if hasKey $modelSpec "pvcStorage" }}
@@ -508,6 +516,9 @@ spec:
             claimName: vllm-templates-pvc
         {{- end }}
         {{- end}}
+        {{- if and (hasKey $modelSpec "debug") $modelSpec.debug }}
+{{ include "chart.vllmDebugVolumes" . | nindent 8 }}
+        {{- end }}
         {{- with $modelSpec.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end}}
@@ -535,6 +546,10 @@ spec:
       {{- end }}
       {{- if $modelSpec.nodeName }}
       nodeName: {{ $modelSpec.nodeName }}
+      {{- end }}
+      {{- with $modelSpec.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if not (empty $modelSpec.affinity) }}
       affinity:
