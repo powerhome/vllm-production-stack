@@ -32,7 +32,7 @@ policy_spec.loader.exec_module(policy_module)
 WorkflowPolicy = policy_module.WorkflowPolicy
 
 SOURCE = "vllm-project/production-stack"
-DEST = "powerhome/production-stack"
+DEST = "powerhome/vllm-production-stack"
 BASE = "powerhrg"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 BOT = "chatgpt-codex-connector"

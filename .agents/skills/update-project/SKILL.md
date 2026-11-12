@@ -1,6 +1,6 @@
 ---
 name: update-project
-description: Use when updating powerhome/production-stack from vllm-project/production-stack while preserving the downstream powerhrg branch and completing the update PR workflow.
+description: Use when updating powerhome/vllm-production-stack from vllm-project/production-stack while preserving the downstream powerhrg branch and completing the update PR workflow.
 ---
 
 # Update project
@@ -66,7 +66,7 @@ alter allowlisted workflows.
    evidence. Distinguish active integrations from stale workflow registry entries;
    only require workflows that remain enabled under this skill's policy.
 3. Run `prepare --manifest FILE --inventory-confirmed`. It verifies remotes,
-   synchronizes `powerhome/production-stack:main` with
+   synchronizes `powerhome/vllm-production-stack:main` with
    `vllm-project/production-stack:main` using `gh repo sync`, verifies parity,
    records the upstream SHA, and creates or resumes an owned
    `update-project/<upstream-sha-prefix>` branch from current `origin/powerhrg`.
