@@ -35,7 +35,11 @@ while pending:
         raise SystemExit(f'Unsupported build dependency source: {name}')
     selected[name] = package
     for dependency in package.get('dependencies', []):
-        if 'marker' in dependency:
+        # The release target is linux/amd64; uv repeats this platform bound
+        # on dependencies when the source limits its supported environments.
+        if dependency.get('marker') not in (
+            None, "platform_machine != 's390x' and sys_platform == 'linux'"
+        ):
             raise SystemExit(f'Unsupported conditional build dependency: {name}')
         pending.append(dependency['name'])
 lines = []
