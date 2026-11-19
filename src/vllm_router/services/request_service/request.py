@@ -779,6 +779,10 @@ async def route_general_request(
             owner = await _locate_response_owner(
                 request, service_discovery, endpoints, response_id
             )
+            if owner.sleep:
+                raise HTTPException(
+                    status_code=503, detail="The owning engine is asleep."
+                )
             if requested_model is not None and requested_model not in owner.model_names:
                 raise HTTPException(
                     status_code=404,
@@ -961,7 +965,9 @@ async def route_discovered_inference(
         raise HTTPException(status_code=404, detail="Not Found")
 
     service_discovery = get_service_discovery()
-    endpoints = [ep for ep in service_discovery.get_endpoint_info() if not ep.sleep]
+    endpoints = service_discovery.get_endpoint_info()
+    if response_id is None:
+        endpoints = [ep for ep in endpoints if not ep.sleep]
     client = request.app.state.aiohttp_client_wrapper()
     discovery = getattr(request.app.state, "inference_discovery", None)
     if discovery is None:

@@ -174,9 +174,10 @@ async def test_responses_followups_only_reach_confirmed_owner(monkeypatch):
     async with proxy_client(monkeypatch, backend(False), backend(True)) as (
         _,
         client,
-        _,
+        endpoints,
     ):
         headers = {"Authorization": "Bearer test-client"}
+        endpoints[1].sleep = True
         retrieval = await client.get(
             "/v1/responses/resp_example?stream=true&starting_after=2", headers=headers
         )
@@ -192,14 +193,18 @@ async def test_responses_followups_only_reach_confirmed_owner(monkeypatch):
         assert (
             await client.post("/v1/responses/resp_example", headers=headers)
         ).status_code == 404
+        continuation_payload = {
+            "model": "test-model",
+            "previous_response_id": "resp_example",
+            "input": "next",
+        }
+        asleep = await client.post(
+            "/v1/responses", headers=headers, json=continuation_payload
+        )
+        assert asleep.status_code == 503
+        endpoints[1].sleep = False
         continuation = await client.post(
-            "/v1/responses",
-            headers=headers,
-            json={
-                "model": "test-model",
-                "previous_response_id": "resp_example",
-                "input": "next",
-            },
+            "/v1/responses", headers=headers, json=continuation_payload
         )
         assert continuation.json()["id"] == "resp_next"
         assert events == ["stream", ("cancel", True), ("continue", True)]
