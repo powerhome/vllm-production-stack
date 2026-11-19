@@ -1,4 +1,5 @@
 import abc
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Optional
 
@@ -20,6 +21,7 @@ class ExternalProviderResponse:
     stream_iterator: Optional[AsyncIterator[bytes]] = (
         None  # For streaming responses, an iterator over response chunks
     )
+    close_stream: Callable[[], None] | None = None
 
 
 @dataclass

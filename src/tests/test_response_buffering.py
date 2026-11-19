@@ -182,38 +182,30 @@ async def test_backend_timeout_applies_only_to_non_streaming(
 
 
 @pytest.mark.asyncio
-async def test_backend_connection_closes_when_client_disconnects(monitor):
+async def test_cancelling_proxy_io_closes_backend_connection_and_releases_slot(monitor):
     import asyncio
 
     import aiohttp
     from aiohttp import web
 
-    from vllm_router.services.request_service.request import (
-        _await_unless_client_disconnects,
-        _ClientDisconnected,
-    )
-
+    backend_saw_request = asyncio.Event()
     backend_saw_close = asyncio.Event()
 
     async def generating(request):
-        # Like vLLM, keep working until the router's connection goes away.
-        while request.transport is not None and not request.transport.is_closing():
-            await asyncio.sleep(0.01)
-        backend_saw_close.set()
-        return web.Response()
+        try:
+            backend_saw_request.set()
+            await asyncio.Event().wait()
+        finally:
+            backend_saw_close.set()
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", generating)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, handler_cancellation=True)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
     port = runner.addresses[0][1]
     session = aiohttp.ClientSession()
-
-    async def receive():
-        await asyncio.sleep(0.1)
-        return {"type": "http.disconnect"}
 
     state = types.SimpleNamespace(
         otel_enabled=False,
@@ -225,17 +217,22 @@ async def test_backend_connection_closes_when_client_disconnects(monitor):
         method="POST",
         headers={"content-type": "application/json"},
         app=types.SimpleNamespace(state=state),
-        receive=receive,
     )
     body = json.dumps({"model": "test-model", "stream": False}).encode()
     gen = process_request(
         request, body, f"http://127.0.0.1:{port}", "req-1", "/v1/chat/completions", None
     )
+    work = asyncio.create_task(anext(gen))
     try:
-        with pytest.raises(_ClientDisconnected):
-            await _await_unless_client_disconnects(request, anext(gen))
-        await asyncio.wait_for(backend_saw_close.wait(), 5)
+        await asyncio.wait_for(backend_saw_request.wait(), 2)
+        work.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await work
+        await asyncio.wait_for(backend_saw_close.wait(), 2)
     finally:
+        if not work.done():
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
         await session.close()
         await runner.cleanup()
 

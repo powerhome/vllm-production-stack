@@ -24,7 +24,9 @@ from vllm_router.dynamic_config import get_dynamic_config_watcher
 from vllm_router.log import init_logger
 from vllm_router.protocols import ModelCard, ModelList
 from vllm_router.service_discovery import get_service_discovery
+from vllm_router.services.request_service.disconnect import DisconnectAwareRoute
 from vllm_router.services.request_service.request import (
+    route_discovered_inference,
     route_general_request,
     route_general_transcriptions,
     route_multipart_request,
@@ -44,11 +46,13 @@ except ImportError:
     semantic_cache_available = False
 
 main_router = APIRouter()
+inference_router = APIRouter(route_class=DisconnectAwareRoute)
+inference_fallback_router = APIRouter(route_class=DisconnectAwareRoute)
 
 logger = init_logger(__name__)
 
 
-@main_router.post("/v1/chat/completions")
+@inference_router.post("/v1/chat/completions")
 async def route_chat_completion(request: Request, background_tasks: BackgroundTasks):
     if semantic_cache_available:
         # Check if the request can be served from the semantic cache
@@ -65,57 +69,57 @@ async def route_chat_completion(request: Request, background_tasks: BackgroundTa
     )
 
 
-@main_router.post("/v1/completions")
+@inference_router.post("/v1/completions")
 async def route_completion(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/completions", background_tasks)
 
 
-@main_router.post("/v1/embeddings")
+@inference_router.post("/v1/embeddings")
 async def route_embeddings(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/embeddings", background_tasks)
 
 
-@main_router.post("/pooling")
+@inference_router.post("/pooling")
 async def route_pooling(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/pooling", background_tasks)
 
 
-@main_router.post("/tokenize")
+@inference_router.post("/tokenize")
 async def route_tokenize(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/tokenize", background_tasks)
 
 
-@main_router.post("/detokenize")
+@inference_router.post("/detokenize")
 async def route_detokenize(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/detokenize", background_tasks)
 
 
-@main_router.post("/v1/rerank")
+@inference_router.post("/v1/rerank")
 async def route_v1_rerank(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/rerank", background_tasks)
 
 
-@main_router.post("/rerank")
+@inference_router.post("/rerank")
 async def route_rerank(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/rerank", background_tasks)
 
 
-@main_router.post("/v1/score")
+@inference_router.post("/v1/score")
 async def route_v1_score(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/score", background_tasks)
 
 
-@main_router.post("/score")
+@inference_router.post("/score")
 async def route_score(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/score", background_tasks)
 
 
-@main_router.post("/v1/systemone")
+@inference_router.post("/v1/systemone")
 async def route_v1_systemone(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/systemone", background_tasks)
 
 
-@main_router.post("/v1/decisions")
+@inference_router.post("/v1/decisions")
 async def route_v1_decisions(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/decisions", background_tasks)
 
@@ -262,7 +266,7 @@ async def health() -> Response:
         return JSONResponse(content={"status": "healthy"}, status_code=200)
 
 
-@main_router.post("/v1/audio/transcriptions")
+@inference_router.post("/v1/audio/transcriptions")
 async def route_v1_audio_transcriptions(
     request: Request, background_tasks: BackgroundTasks
 ):
@@ -272,17 +276,17 @@ async def route_v1_audio_transcriptions(
     )
 
 
-@main_router.post("/v1/responses")
+@inference_router.post("/v1/responses")
 async def route_v1_responses(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/responses", background_tasks)
 
 
-@main_router.post("/v1/audio/speech")
+@inference_router.post("/v1/audio/speech")
 async def route_v1_audio_speech(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/audio/speech", background_tasks)
 
 
-@main_router.post("/v1/audio/translations")
+@inference_router.post("/v1/audio/translations")
 async def route_v1_audio_translations(
     request: Request, background_tasks: BackgroundTasks
 ):
@@ -291,12 +295,12 @@ async def route_v1_audio_translations(
     )
 
 
-@main_router.get("/v1/audio/voices")
+@inference_router.get("/v1/audio/voices")
 async def route_v1_audio_voices(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/audio/voices", background_tasks)
 
 
-@main_router.post("/v1/images/generations")
+@inference_router.post("/v1/images/generations")
 async def route_v1_images_generations(
     request: Request, background_tasks: BackgroundTasks
 ):
@@ -305,11 +309,23 @@ async def route_v1_images_generations(
     )
 
 
-@main_router.post("/v1/images/edits")
+@inference_router.post("/v1/images/edits")
 async def route_v1_images_edit(request: Request, background_tasks: BackgroundTasks):
     return await route_multipart_request(request, "/v1/images/edits", background_tasks)
 
 
-@main_router.post("/v1/messages")
+@inference_router.post("/v1/messages")
 async def route_anthropic_messages(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/messages", background_tasks)
+
+
+main_router.include_router(inference_router)
+
+
+@inference_fallback_router.api_route(
+    "/{path:path}", methods=["GET", "POST"], include_in_schema=False
+)
+async def route_backend_inference(
+    request: Request, path: str, background_tasks: BackgroundTasks
+):
+    return await route_discovered_inference(request, "/" + path, background_tasks)

@@ -244,8 +244,9 @@ def parse_args():
         default=None,
         help="Total timeout in seconds for a non-streaming request to a backend. "
         "When it expires the router returns 504 and closes the backend "
-        "connection. Also limits the TCP connect to 10 seconds, after which "
-        "the request fails over. Default: no limit.",
+        "connection. For these requests, TCP connect is capped at 10 seconds "
+        "or the configured total, whichever is smaller. Connect timeouts "
+        "can fail over. Default: no limit.",
     )
     parser.add_argument(
         "--routing-logic",
