@@ -506,6 +506,10 @@ async def _select_backend(
 ):
     router = request.app.state.router
     if request_endpoint:
+        if isinstance(router, PriorityRouter):
+            request_json[router.priority_field] = router.extract_priority(
+                request, request_json
+            )
         return endpoints[0].url
     if isinstance(
         router, (DisaggregatedPrefillRouter, DisaggregatedPrefillOrchestratedRouter)
@@ -769,11 +773,6 @@ async def route_general_request(
             end_span(span, error=e, status_code=502) if tracing_active else None
             raise
 
-    # Check if model has ever been seen (even if currently scaled to zero)
-    model_ever_existed = False
-    if hasattr(service_discovery, "has_ever_seen_model"):
-        model_ever_existed = service_discovery.has_ever_seen_model(requested_model)
-
     if response_id is not None:
         try:
             owner = await _locate_response_owner(
@@ -826,6 +825,9 @@ async def route_general_request(
     num_incoming_requests_total.labels(model=requested_model).inc()
 
     if not endpoints:
+        model_ever_existed = hasattr(
+            service_discovery, "has_ever_seen_model"
+        ) and service_discovery.has_ever_seen_model(requested_model)
         if not model_ever_existed:
             end_span(span, status_code=404) if tracing_active else None
             return JSONResponse(

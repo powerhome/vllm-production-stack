@@ -11,7 +11,7 @@ from aiohttp.test_utils import TestServer
 from fastapi import FastAPI
 
 from vllm_router.routers import main_router as routes
-from vllm_router.routers.routing_logic import RoundRobinRouter
+from vllm_router.routers.routing_logic import PriorityRouter, RoundRobinRouter
 from vllm_router.services.request_service import request as forwarding
 
 
@@ -117,6 +117,65 @@ async def test_schema_advertised_inference_routes_to_capable_engine(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers,expected_priority", [({"x-request-priority": "-3"}, "-3"), ({}, "5")]
+)
+async def test_explicit_engine_selection_resolves_multipart_priority(
+    monkeypatch, headers, expected_priority
+):
+    path = "/future/audio"
+    schema = {
+        "openapi": "3.1.0",
+        "paths": {
+            path: {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"model": {"type": "string"}},
+                                    "required": ["model"],
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+    def backend(number):
+        async def openapi(_):
+            return web.json_response(schema)
+
+        async def infer(request):
+            assert "id" not in request.query
+            form = await request.post()
+            return web.json_response({"engine": number, "priority": form["priority"]})
+
+        app = web.Application()
+        app.router.add_get("/openapi.json", openapi)
+        app.router.add_post(path, infer)
+        return app
+
+    class TestPriorityRouter(PriorityRouter):
+        pass
+
+    async with proxy_client(monkeypatch, backend(0), backend(1)) as (app, client, _):
+        app.state.router = TestPriorityRouter(priority_default=5)
+        response = await client.post(
+            path,
+            params={"id": "1"},
+            headers=headers,
+            data={"model": "test-model"},
+            files={"file": ("test.wav", b"audio", "audio/wav")},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"engine": 1, "priority": expected_priority}
+
+
+@pytest.mark.asyncio
 async def test_responses_followups_only_reach_confirmed_owner(monkeypatch):
     parameter = {"name": "response_id", "in": "path", "required": True}
     schema = {
@@ -194,7 +253,6 @@ async def test_responses_followups_only_reach_confirmed_owner(monkeypatch):
             await client.post("/v1/responses/resp_example", headers=headers)
         ).status_code == 404
         continuation_payload = {
-            "model": "test-model",
             "previous_response_id": "resp_example",
             "input": "next",
         }
