@@ -368,6 +368,7 @@ def initialize_all(app: FastAPI, args):
     app.state.request_stats_monitor = get_request_stats_monitor()
     app.state.router = get_routing_logic()
     app.state.request_rewriter = get_request_rewriter()
+    app.state.backend_request_timeout_seconds = args.backend_request_timeout_seconds
 
 
 app = FastAPI(lifespan=lifespan)
@@ -378,6 +379,7 @@ app.include_router(metrics_router)
 app.state.aiohttp_client_wrapper = AiohttpClientWrapper()
 app.state.semantic_cache_available = semantic_cache_available
 app.state.otel_enabled = False
+app.state.backend_request_timeout_seconds = None
 
 
 def main():

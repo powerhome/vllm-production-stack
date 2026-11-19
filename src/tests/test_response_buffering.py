@@ -137,3 +137,115 @@ async def test_non_streaming_response_reports_token_usage(monitor):
     after_out = REGISTRY.get_sample_value("vllm:output_tokens_total", labels)
     assert after_in - before_in == 11
     assert after_out - before_out == 22
+
+
+def _recording_request(monitor, captured, timeout_seconds):
+    def request(**kw):
+        captured.update(kw)
+        return _FakeBackendResponse([b"{}"], "application/json")
+
+    state = types.SimpleNamespace(
+        otel_enabled=False,
+        semantic_cache_available=False,
+        request_stats_monitor=monitor,
+        backend_request_timeout_seconds=timeout_seconds,
+        aiohttp_client_wrapper=lambda: types.SimpleNamespace(request=request),
+    )
+    return types.SimpleNamespace(
+        method="POST",
+        headers={"content-type": "application/json"},
+        app=types.SimpleNamespace(state=state),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stream, configured, total, connect",
+    [
+        (False, 30.0, 30.0, 10.0),
+        (False, 5.0, 5.0, 5.0),
+        (False, None, None, None),
+        (True, 30.0, None, None),
+    ],
+)
+async def test_backend_timeout_applies_only_to_non_streaming(
+    monitor, stream, configured, total, connect
+):
+    captured = {}
+    request = _recording_request(monitor, captured, configured)
+    body = json.dumps({"model": "test-model", "stream": stream}).encode()
+
+    await _consume(request, body)
+
+    assert captured["timeout"].total == total
+    assert captured["timeout"].sock_connect == connect
+
+
+@pytest.mark.asyncio
+async def test_backend_connection_closes_when_client_disconnects(monitor):
+    import asyncio
+
+    import aiohttp
+    from aiohttp import web
+
+    from vllm_router.services.request_service.request import (
+        _await_unless_client_disconnects,
+        _ClientDisconnected,
+    )
+
+    backend_saw_close = asyncio.Event()
+
+    async def generating(request):
+        # Like vLLM, keep working until the router's connection goes away.
+        while request.transport is not None and not request.transport.is_closing():
+            await asyncio.sleep(0.01)
+        backend_saw_close.set()
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", generating)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+    session = aiohttp.ClientSession()
+
+    async def receive():
+        await asyncio.sleep(0.1)
+        return {"type": "http.disconnect"}
+
+    state = types.SimpleNamespace(
+        otel_enabled=False,
+        semantic_cache_available=False,
+        request_stats_monitor=monitor,
+        aiohttp_client_wrapper=lambda: session,
+    )
+    request = types.SimpleNamespace(
+        method="POST",
+        headers={"content-type": "application/json"},
+        app=types.SimpleNamespace(state=state),
+        receive=receive,
+    )
+    body = json.dumps({"model": "test-model", "stream": False}).encode()
+    gen = process_request(
+        request, body, f"http://127.0.0.1:{port}", "req-1", "/v1/chat/completions", None
+    )
+    try:
+        with pytest.raises(_ClientDisconnected):
+            await _await_unless_client_disconnects(request, anext(gen))
+        await asyncio.wait_for(backend_saw_close.wait(), 5)
+    finally:
+        await session.close()
+        await runner.cleanup()
+
+    assert monitor.in_prefill_requests[f"http://127.0.0.1:{port}"] == 0
+    latency = REGISTRY.get_sample_value(
+        "vllm:request_latency_seconds_count",
+        {
+            "server": f"http://127.0.0.1:{port}",
+            "model": "test-model",
+            "status": "cancelled",
+        },
+    )
+    assert latency == 1

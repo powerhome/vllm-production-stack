@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -221,3 +222,124 @@ async def test_http_exception_not_retried(setup):
             await route_general_request(req, "/v1/chat/completions", MagicMock())
 
     assert call_count == 1
+
+
+def _disconnect_after(delay):
+    async def receive():
+        await asyncio.sleep(delay)
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+async def _never_disconnects():
+    await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_cancels_backend_and_returns_499(setup):
+    req, router = setup
+    router.max_instance_failover_reroute_attempts = 1
+    req.receive = _disconnect_after(0.05)
+    calls = 0
+    cancelled = asyncio.Event()
+
+    async def hangs(*a, **kw):
+        nonlocal calls
+        calls += 1
+        try:
+            await asyncio.Event().wait()  # vLLM still generating
+            yield MOCK_HEADERS, 200
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with patch(
+        "vllm_router.services.request_service.request.process_request",
+        side_effect=hangs,
+    ):
+        from vllm_router.services.request_service.request import route_general_request
+
+        resp = await asyncio.wait_for(
+            route_general_request(req, "/v1/chat/completions", MagicMock()), 5
+        )
+
+    assert resp.status_code == 499
+    assert cancelled.is_set()
+    assert calls == 1  # a disconnect does not fail over
+
+
+@pytest.mark.asyncio
+async def test_connected_client_gets_backend_response(setup):
+    req, router = setup
+    req.receive = _never_disconnects
+
+    async def ok(*a, **kw):
+        await asyncio.sleep(0.05)
+        yield MOCK_HEADERS, 200
+        yield b"done"
+
+    with patch(
+        "vllm_router.services.request_service.request.process_request", side_effect=ok
+    ):
+        from vllm_router.services.request_service.request import route_general_request
+
+        resp = await route_general_request(req, "/v1/chat/completions", MagicMock())
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_backend_timeout_returns_504_without_failover(setup):
+    from fastapi import HTTPException
+
+    req, router = setup
+    router.max_instance_failover_reroute_attempts = 1
+    req.receive = _never_disconnects
+    calls = 0
+
+    async def times_out(*a, **kw):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError()
+        yield
+
+    with patch(
+        "vllm_router.services.request_service.request.process_request",
+        side_effect=times_out,
+    ):
+        from vllm_router.services.request_service.request import route_general_request
+
+        with pytest.raises(HTTPException) as exc:
+            await route_general_request(req, "/v1/chat/completions", MagicMock())
+
+    assert exc.value.status_code == 504
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_fails_over(setup):
+    import aiohttp
+
+    req, router = setup
+    router.max_instance_failover_reroute_attempts = 1
+    req.receive = _never_disconnects
+    urls_called = []
+
+    async def connect_timeout_then_ok(r, body, server_url, *a, **kw):
+        urls_called.append(server_url)
+        if len(urls_called) == 1:
+            raise aiohttp.ConnectionTimeoutError("connect timeout")
+        yield MOCK_HEADERS, 200
+        yield b"done"
+
+    with patch(
+        "vllm_router.services.request_service.request.process_request",
+        side_effect=connect_timeout_then_ok,
+    ):
+        from vllm_router.services.request_service.request import route_general_request
+
+        resp = await route_general_request(req, "/v1/chat/completions", MagicMock())
+
+    assert resp.status_code == 200
+    assert len(urls_called) == 2

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import os
 import time
@@ -106,6 +107,45 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
 def _is_json_media_type(content_type: str) -> bool:
     media_type = content_type.partition(";")[0].strip().lower()
     return media_type == "application/json" or media_type.endswith("+json")
+
+
+_BACKEND_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+class _ClientDisconnected(Exception):
+    """The client closed its connection before the backend answered."""
+
+
+async def _wait_for_client_disconnect(request: Request) -> None:
+    """Return when the client closes its connection."""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+async def _await_unless_client_disconnects(request: Request, awaitable):
+    """Await the backend, cancelling it if the client disconnects first.
+
+    Cancelling closes the backend connection, which makes vLLM abort the
+    generation. Raises _ClientDisconnected after the cancellation completes.
+    """
+    work = asyncio.ensure_future(awaitable)
+    watcher = asyncio.ensure_future(_wait_for_client_disconnect(request))
+    try:
+        await asyncio.wait({work, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        if work.done():
+            return work.result()
+        if watcher.exception() is not None:
+            # Disconnects cannot be observed; wait for the backend as before.
+            return await work
+        work.cancel()
+        await asyncio.gather(work, return_exceptions=True)
+        raise _ClientDisconnected()
+    finally:
+        watcher.cancel()
+        if not work.done():
+            work.cancel()
 
 
 async def process_external_provider_request(
@@ -326,12 +366,30 @@ async def process_request(
 
         request_status = "success"
 
+        # The total timeout applies to non-streaming requests only.
+        configured_timeout = getattr(
+            request.app.state, "backend_request_timeout_seconds", None
+        )
+        total_timeout = (
+            configured_timeout
+            if not is_streaming and isinstance(configured_timeout, (int, float))
+            else None
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=total_timeout,
+            sock_connect=(
+                None
+                if total_timeout is None
+                else min(total_timeout, _BACKEND_CONNECT_TIMEOUT_SECONDS)
+            ),
+        )
+
         async with request.app.state.aiohttp_client_wrapper().request(
             method=request.method,
             url=backend_url + endpoint,
             headers=headers,
             data=body,
-            timeout=aiohttp.ClientTimeout(total=None),
+            timeout=timeout,
         ) as backend_response:
             http_status_code = backend_response.status
             # Set response status on span if tracing
@@ -383,6 +441,9 @@ async def process_request(
             background_tasks.add_task(
                 request.app.state.callbacks.post_request, request, full_response
             )
+    except asyncio.CancelledError:
+        request_status = "cancelled"
+        raise
     except Exception as e:
         request_status = "error"
         # Track other errors
@@ -677,7 +738,9 @@ async def route_general_request(
                 background_tasks,
                 parent_span_context=span_context,
             )
-            headers, status = await anext(stream_generator)
+            headers, status = await _await_unless_client_disconnects(
+                request, anext(stream_generator)
+            )
             media_type = headers.get("content-type", "text/event-stream")
             headers_dict = {
                 key: value
@@ -688,9 +751,24 @@ async def route_general_request(
             headers_dict["X-Request-Id"] = request_id
             last_error = None
             break
+        except _ClientDisconnected:
+            logger.info(
+                f"Request {request_id} cancelled on {server_url}: client disconnected"
+            )
+            end_span(span, status_code=499) if tracing_active else None
+            return Response(status_code=499, headers={"X-Request-Id": request_id})
         except HTTPException:
             raise
         except Exception as e:
+            if isinstance(e, TimeoutError) and not isinstance(
+                e, aiohttp.ConnectionTimeoutError
+            ):
+                # Only a connect timeout is an instance failure that fails over.
+                logger.warning(f"Request {request_id} timed out on {server_url}: {e!r}")
+                end_span(span, error=e, status_code=504) if tracing_active else None
+                raise HTTPException(
+                    status_code=504, detail="Backend request timed out."
+                ) from e
             error_urls.add(server_url)
             last_error = e
             logger.warning(
