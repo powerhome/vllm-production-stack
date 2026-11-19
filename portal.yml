@@ -1,0 +1,13 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: vllm-production-stack
+  title: vLLM Production Stack
+  description: Power's copy of vLLM production-stack, the Helm chart and router Cortex deploys
+  annotations:
+    github.com/project-slug: powerhome/vllm-production-stack
+spec:
+  system: nitro-intelligence-platform
+  type: library
+  owner: metal-men
+  lifecycle: production
