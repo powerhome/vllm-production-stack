@@ -30,7 +30,7 @@ from vllm_router.log import JsonFormatter, init_logger, set_log_format, set_log_
 from vllm_router.parsers.parser import parse_args
 from vllm_router.routers.batches_router import batches_router
 from vllm_router.routers.files_router import files_router
-from vllm_router.routers.main_router import main_router
+from vllm_router.routers.main_router import inference_fallback_router, main_router
 from vllm_router.routers.metrics_router import metrics_router
 from vllm_router.routers.routing_logic import (
     cleanup_routing_logic,
@@ -368,6 +368,7 @@ def initialize_all(app: FastAPI, args):
     app.state.request_stats_monitor = get_request_stats_monitor()
     app.state.router = get_routing_logic()
     app.state.request_rewriter = get_request_rewriter()
+    app.state.backend_request_timeout_seconds = args.backend_request_timeout_seconds
 
 
 app = FastAPI(lifespan=lifespan)
@@ -375,9 +376,11 @@ app.include_router(main_router)
 app.include_router(files_router)
 app.include_router(batches_router)
 app.include_router(metrics_router)
+app.include_router(inference_fallback_router)
 app.state.aiohttp_client_wrapper = AiohttpClientWrapper()
 app.state.semantic_cache_available = semantic_cache_available
 app.state.otel_enabled = False
+app.state.backend_request_timeout_seconds = None
 
 
 def main():

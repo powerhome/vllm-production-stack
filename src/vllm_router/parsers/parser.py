@@ -114,6 +114,11 @@ def validate_args(args):
         raise ValueError("Engine stats interval must be greater than 0.")
     if args.request_stats_window <= 0:
         raise ValueError("Request stats window must be greater than 0.")
+    if (
+        args.backend_request_timeout_seconds is not None
+        and args.backend_request_timeout_seconds <= 0
+    ):
+        raise ValueError("Backend request timeout must be greater than 0.")
     if not (0.0 <= args.sentry_traces_sample_rate <= 1.0):
         raise ValueError("Sentry traces sample rate must be between 0.0 and 1.0.")
     if not (0.0 <= args.sentry_profile_session_sample_rate <= 1.0):
@@ -232,6 +237,16 @@ def parse_args():
         type=int,
         default=10,
         help="Timeout in seconds for backend health check requests (default: 10).",
+    )
+    parser.add_argument(
+        "--backend-request-timeout-seconds",
+        type=float,
+        default=None,
+        help="Total timeout in seconds for a non-streaming request to a backend. "
+        "When it expires the router returns 504 and closes the backend "
+        "connection. For these requests, TCP connect is capped at 10 seconds "
+        "or the configured total, whichever is smaller. Connect timeouts "
+        "can fail over. Default: no limit.",
     )
     parser.add_argument(
         "--routing-logic",

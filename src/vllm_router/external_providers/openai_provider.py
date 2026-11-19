@@ -126,6 +126,7 @@ class OpenAIProvider(ExternalProviderAdapter):
             body=None,
             is_stream=True,
             stream_iterator=stream_chunks(),
+            close_stream=response.close,
         )
 
     async def health_check(self) -> bool:

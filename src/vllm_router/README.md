@@ -96,6 +96,26 @@ vllm-router --port 8000 \
     --routing-logic roundrobin
 ```
 
+## HTTP inference and client disconnects
+
+The router forwards new HTTP inference operations advertised by each
+discovered vLLM engine at `/openapi.json`. Engines that disable OpenAPI still
+serve the router's compatibility routes. Model routing considers the engines
+that advertise the requested operation. If a discovered operation allows an
+omitted model, clients may omit it when exactly one eligible model is available.
+
+When a client disconnects, the router closes the active upstream request,
+including while it is waiting for headers or streaming a response. The
+upstream server determines how it stops work after socket closure. vLLM
+Responses created with `background=true` follow vLLM's detached job lifecycle.
+
+Responses retrieval, explicit cancellation, and continuation with
+`previous_response_id` use read-only lookups to locate the engine that owns the
+response. Use pod-IP discovery or configure a static URL per engine with a single
+vLLM API server process. vLLM must have its Responses store enabled on those
+engines. A load-balanced service URL can address multiple independent stores
+and cannot provide this affinity.
+
 ## Backend health checks
 
 By enabling the `--static-backend-health-checks` flag, **vllm-router** will send a simple request to

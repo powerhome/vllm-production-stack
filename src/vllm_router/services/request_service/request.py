@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import os
 import time
 import uuid
+from contextlib import aclosing
 from typing import Optional
+from urllib.parse import quote, urlencode
 
 import aiohttp
 
@@ -37,7 +40,18 @@ from vllm_router.routers.routing_logic import (
     PriorityRouter,
     SessionRouter,
 )
-from vllm_router.service_discovery import get_service_discovery
+from vllm_router.service_discovery import (
+    EndpointInfo,
+    K8sServiceNameServiceDiscovery,
+    get_service_discovery,
+)
+from vllm_router.services.request_service.disconnect import request_lifetime
+from vllm_router.services.request_service.openapi import OpenAPIInferenceDiscovery
+from vllm_router.services.request_service.responses import (
+    find_response_owner,
+    response_resource_id,
+    response_resource_path,
+)
 from vllm_router.services.request_service.rewriter import (
     get_request_rewriter,
     is_request_rewriter_initialized,
@@ -87,6 +101,8 @@ _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
     "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
     "transfer-encoding",
     "content-length",
     "upgrade",
@@ -106,6 +122,29 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
 def _is_json_media_type(content_type: str) -> bool:
     media_type = content_type.partition(";")[0].strip().lower()
     return media_type == "application/json" or media_type.endswith("+json")
+
+
+_BACKEND_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+def _request_id(request: Request) -> str:
+    lifetime = request_lifetime(request)
+    if lifetime is not None:
+        return lifetime.request_id
+    return request.headers.get("X-Request-Id") or str(uuid.uuid4())
+
+
+def _backend_target(request: Request, path: str) -> str:
+    if not isinstance(request, Request):
+        return path
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in request.query_params.multi_items()
+            if key != "id"
+        ]
+    )
+    return f"{path}?{query}" if query else path
 
 
 async def process_external_provider_request(
@@ -181,8 +220,23 @@ async def process_external_provider_request(
                     )
                     raise
 
+            lifetime = request_lifetime(request)
+            body_iterator = stream_wrapper()
+            if lifetime is not None:
+
+                async def close_provider_stream():
+                    if provider_response.close_stream is not None:
+                        provider_response.close_stream()
+                    close_iterator = getattr(
+                        provider_response.stream_iterator, "aclose", None
+                    )
+                    if close_iterator is not None:
+                        await close_iterator()
+
+                lifetime.add_cleanup(close_provider_stream)
+                lifetime.add_cleanup(body_iterator.aclose)
             return StreamingResponse(
-                stream_wrapper(),
+                body_iterator,
                 status_code=provider_response.status_code,
                 headers=response_headers,
                 media_type=media_type,
@@ -214,9 +268,13 @@ def _build_backend_request_headers(
     request: Request, request_id: str, *, include_content_type: bool = True
 ) -> dict[str, str]:
     headers = {}
+    connection_headers = {
+        name.strip().lower()
+        for name in request.headers.get("connection", "").split(",")
+    }
     for key, value in request.headers.items():
         lowered_key = key.lower()
-        if lowered_key in _HOP_BY_HOP_HEADERS:
+        if lowered_key in _HOP_BY_HOP_HEADERS or lowered_key in connection_headers:
             continue
         if not include_content_type and lowered_key == "content-type":
             continue
@@ -239,6 +297,8 @@ async def process_request(
     background_tasks: BackgroundTasks,
     debug_request=None,
     parent_span_context=None,
+    *,
+    parsed_body: dict | None = None,
 ):
     """
     Process a request by sending it to the chosen backend.
@@ -290,12 +350,18 @@ async def process_request(
     model_name = "unknown"
     request_status = "error"
     http_status_code = None
+    lifetime = request_lifetime(request)
 
     try:
         # Check if this is a streaming request and extract model name
         try:
-            request_json = json.loads(body)
-            is_streaming = request_json.get("stream", False)
+            request_json = json.loads(body) if parsed_body is None else parsed_body
+            is_streaming = request_json.get("stream", False) or (
+                isinstance(request, Request)
+                and request.method == "GET"
+                and request.query_params.get("stream", "").lower()
+                in {"1", "on", "t", "true", "y", "yes"}
+            )
             model_name = request_json.get("model", "unknown")
         except (JSONDecodeError, UnicodeDecodeError, ValueError):
             # If we can't parse the body as JSON, assume it's not streaming
@@ -326,20 +392,40 @@ async def process_request(
 
         request_status = "success"
 
+        # The total timeout applies to non-streaming requests only.
+        configured_timeout = getattr(
+            request.app.state, "backend_request_timeout_seconds", None
+        )
+        total_timeout = (
+            configured_timeout
+            if not is_streaming and isinstance(configured_timeout, (int, float))
+            else None
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=total_timeout,
+            sock_connect=(
+                None
+                if total_timeout is None
+                else min(total_timeout, _BACKEND_CONNECT_TIMEOUT_SECONDS)
+            ),
+        )
+
         async with request.app.state.aiohttp_client_wrapper().request(
             method=request.method,
-            url=backend_url + endpoint,
+            url=backend_url.rstrip("/") + _backend_target(request, endpoint),
             headers=headers,
             data=body,
-            timeout=aiohttp.ClientTimeout(total=None),
+            timeout=timeout,
+            allow_redirects=False,
         ) as backend_response:
             http_status_code = backend_response.status
             # Set response status on span if tracing
             if span is not None:
                 span.set_attribute("http.status_code", backend_response.status)
 
-            # Yield headers and status code first.
-            yield backend_response.headers, backend_response.status
+            # A configured total timeout must expire before we commit downstream headers.
+            if total_timeout is None:
+                yield backend_response.headers, backend_response.status
             # Stream response content.
             async for chunk in backend_response.content.iter_any():
                 total_len += len(chunk)
@@ -351,7 +437,12 @@ async def process_request(
                 # Collect the body only when a consumer needs it
                 if full_response is not None:
                     full_response.extend(chunk)
-                yield chunk
+                if total_timeout is None:
+                    yield chunk
+            if total_timeout is not None:
+                yield backend_response.headers, backend_response.status
+                if full_response:
+                    yield bytes(full_response)
 
         if http_status_code is not None and http_status_code >= 400:
             request_status = "error"
@@ -374,7 +465,7 @@ async def process_request(
 
         # Store in semantic cache if applicable
         # Use the full response for non-streaming requests, or the last chunk for streaming
-        if request.app.state.semantic_cache_available:
+        if body and first_token and request.app.state.semantic_cache_available:
             cache_chunk = bytes(full_response) if not is_streaming else chunk
             await store_in_semantic_cache(
                 endpoint=endpoint, method=request.method, body=body, chunk=cache_chunk
@@ -383,6 +474,13 @@ async def process_request(
             background_tasks.add_task(
                 request.app.state.callbacks.post_request, request, full_response
             )
+    except asyncio.CancelledError:
+        request_status = "cancelled"
+        raise
+    except GeneratorExit:
+        if lifetime is not None and lifetime.disconnected:
+            request_status = "cancelled"
+        raise
     except Exception as e:
         request_status = "error"
         # Track other errors
@@ -403,8 +501,109 @@ async def process_request(
         end_span(span) if tracing_active else None
 
 
+async def _select_backend(
+    request, endpoints, engine_stats, request_stats, request_json, request_endpoint
+):
+    router = request.app.state.router
+    if request_endpoint:
+        if isinstance(router, PriorityRouter):
+            request_json[router.priority_field] = router.extract_priority(
+                request, request_json
+            )
+        return endpoints[0].url
+    if isinstance(
+        router, (DisaggregatedPrefillRouter, DisaggregatedPrefillOrchestratedRouter)
+    ):
+        decode_endpoints = [
+            ep for ep in endpoints if ep.model_label in router.decode_model_labels
+        ]
+        if isinstance(router, DisaggregatedPrefillOrchestratedRouter):
+            return router.select_decode_endpoint(decode_endpoints or endpoints).url
+        return (decode_endpoints or endpoints)[0].url
+    if isinstance(
+        router, (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter)
+    ):
+        return await router.route_request(
+            endpoints, engine_stats, request_stats, request, request_json
+        )
+    return router.route_request(endpoints, engine_stats, request_stats, request)
+
+
+async def _locate_response_owner(
+    request: Request, discovery, endpoints: list[EndpointInfo], response_id: str
+) -> EndpointInfo:
+    if isinstance(discovery, K8sServiceNameServiceDiscovery):
+        raise HTTPException(
+            status_code=503,
+            detail="Responses require individually addressable engines.",
+        )
+    owner = await find_response_owner(
+        request.app.state.aiohttp_client_wrapper(),
+        endpoints,
+        response_id,
+        _build_backend_request_headers(request, _request_id(request)),
+    )
+    selected_id = request.query_params.get("id")
+    if selected_id is not None and selected_id != owner.Id:
+        raise HTTPException(
+            status_code=404, detail="Response is not on the selected engine."
+        )
+    return owner
+
+
+async def _streaming_backend_response(
+    request: Request, stream_generator, request_id: str, span=None
+) -> StreamingResponse:
+    headers, status = await anext(stream_generator)
+    lifetime = request_lifetime(request)
+    if lifetime is not None:
+        lifetime.add_cleanup(stream_generator.aclose)
+    headers_dict = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _HEADERS_TO_STRIP_FROM_RESPONSE
+        and key.lower() != "content-type"
+    }
+    headers_dict["X-Request-Id"] = request_id
+
+    async def traced_stream():
+        try:
+            async with aclosing(stream_generator):
+                async for chunk in stream_generator:
+                    yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            if span is not None:
+                end_span(
+                    span,
+                    status_code=499 if lifetime and lifetime.disconnected else None,
+                )
+            raise
+        except Exception as e:
+            if span is not None:
+                end_span(span, error=e, status_code=500)
+            raise
+        else:
+            if span is not None:
+                end_span(span, status_code=status)
+
+    body_iterator = traced_stream()
+    if lifetime is not None:
+        lifetime.add_cleanup(body_iterator.aclose)
+    return StreamingResponse(
+        body_iterator,
+        status_code=status,
+        headers=headers_dict,
+        media_type=headers.get("content-type", "text/event-stream"),
+    )
+
+
 async def route_general_request(
-    request: Request, endpoint: str, background_tasks: BackgroundTasks
+    request: Request,
+    endpoint: str,
+    background_tasks: BackgroundTasks,
+    *,
+    eligible_endpoints: list[EndpointInfo] | None = None,
+    implicit_model: str | None = None,
 ):
     """
     Route the incoming request to the backend server and stream the response back to the client.
@@ -421,21 +620,37 @@ async def route_general_request(
     Returns:
         StreamingResponse: A response object that streams data from the backend server to the client.
     """
-    if isinstance(request.app.state.router, DisaggregatedPrefillRouter):
+    response_id = None
+    if endpoint == "/v1/responses" and isinstance(request, Request):
+        try:
+            response_body = await request.json()
+            if isinstance(response_body, dict):
+                previous_id = response_body.get("previous_response_id")
+                if isinstance(previous_id, str) and previous_id:
+                    response_id = previous_id
+        except (ValueError, RecursionError):
+            pass
+
+    legacy_routing = eligible_endpoints is None and response_id is None
+    if legacy_routing and isinstance(
+        request.app.state.router, DisaggregatedPrefillRouter
+    ):
         response = await route_disaggregated_prefill_request(
             request, endpoint, background_tasks
         )
         return response
 
     # Handle orchestrated disaggregated inference (NxDI pattern)
-    if isinstance(request.app.state.router, DisaggregatedPrefillOrchestratedRouter):
+    if legacy_routing and isinstance(
+        request.app.state.router, DisaggregatedPrefillOrchestratedRouter
+    ):
         response = await route_orchestrated_disaggregated_request(
             request, endpoint, background_tasks
         )
         return response
     in_router_time = time.time()
     # Same as vllm, Get request_id from X-Request-Id header if available
-    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request_id = _request_id(request)
     request_body = await request.body()
     try:
         request_json = json.loads(request_body) if request_body else {}
@@ -469,6 +684,14 @@ async def route_general_request(
                 "vllm.request_id": request_id,
             },
         )
+        lifetime = request_lifetime(request)
+        if span is not None and lifetime is not None:
+
+            async def finish_span():
+                if span.is_recording():
+                    end_span(span, status_code=499 if lifetime.disconnected else None)
+
+            lifetime.add_cleanup(finish_span)
 
     if request.query_params:
         request_endpoint = request.query_params.get("id")
@@ -483,8 +706,10 @@ async def route_general_request(
         response_overwrite.headers["X-Request-Id"] = request_id
         return response_overwrite
 
-    requested_model = request_json.get("model", None)
+    requested_model = request_json.get("model")
     if requested_model is None:
+        requested_model = implicit_model
+    if requested_model is None and response_id is None:
         end_span(span, status_code=400) if tracing_active else None
         return JSONResponse(
             status_code=400,
@@ -493,11 +718,11 @@ async def route_general_request(
         )
 
     # Add model info to parent span
-    if span is not None:
+    if span is not None and requested_model is not None:
         span.set_attribute("vllm.model", requested_model)
 
     # Apply request rewriting if enabled
-    if is_request_rewriter_initialized():
+    if requested_model is not None and is_request_rewriter_initialized():
         rewriter = get_request_rewriter()
         rewritten_body = rewriter.rewrite_request(
             request_body, requested_model, endpoint
@@ -514,7 +739,11 @@ async def route_general_request(
             )
 
     service_discovery = get_service_discovery()
-    endpoints = service_discovery.get_endpoint_info()
+    endpoints = (
+        service_discovery.get_endpoint_info()
+        if eligible_endpoints is None
+        else eligible_endpoints
+    )
 
     aliases = getattr(service_discovery, "aliases", None)
     if aliases and requested_model in aliases.keys():
@@ -524,10 +753,19 @@ async def route_general_request(
 
     # Check if this model should be routed to an external provider
     registry = getattr(request.app.state, "external_provider_registry", None)
-    if registry is not None and registry.is_external_model(requested_model):
+    if (
+        eligible_endpoints is None
+        and requested_model is not None
+        and registry is not None
+        and registry.is_external_model(requested_model)
+    ):
         try:
             response = await process_external_provider_request(
-                request, endpoint, request_json, request_id, background_tasks
+                request,
+                _backend_target(request, endpoint),
+                request_json,
+                request_id,
+                background_tasks,
             )
             end_span(span, status_code=response.status_code) if tracing_active else None
             return response
@@ -535,11 +773,31 @@ async def route_general_request(
             end_span(span, error=e, status_code=502) if tracing_active else None
             raise
 
-    # Check if model has ever been seen (even if currently scaled to zero)
-    model_ever_existed = False
-    if hasattr(service_discovery, "has_ever_seen_model"):
-        model_ever_existed = service_discovery.has_ever_seen_model(requested_model)
-
+    if response_id is not None:
+        try:
+            owner = await _locate_response_owner(
+                request, service_discovery, endpoints, response_id
+            )
+            if owner.sleep:
+                raise HTTPException(
+                    status_code=503, detail="The owning engine is asleep."
+                )
+            if requested_model is not None and requested_model not in owner.model_names:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Requested model is not on the owning engine.",
+                )
+            endpoints = [owner]
+            request_endpoint = owner.Id
+            requested_model = requested_model or next(
+                iter(owner.model_names), "unknown"
+            )
+        except HTTPException as exc:
+            if tracing_active:
+                end_span(span, status_code=exc.status_code)
+            raise
+    engine_stats = {}
+    request_stats = {}
     if not request_endpoint:
         endpoints = list(
             filter(
@@ -567,6 +825,9 @@ async def route_general_request(
     num_incoming_requests_total.labels(model=requested_model).inc()
 
     if not endpoints:
+        model_ever_existed = hasattr(
+            service_discovery, "has_ever_seen_model"
+        ) and service_discovery.has_ever_seen_model(requested_model)
         if not model_ever_existed:
             end_span(span, status_code=404) if tracing_active else None
             return JSONResponse(
@@ -588,23 +849,9 @@ async def route_general_request(
             )
 
     logger.debug(f"Routing request {request_id} for model: {requested_model}")
-    if request_endpoint:
-        server_url = endpoints[0].url
-        logger.debug(
-            f"Routing request {request_id} to engine with Id: {endpoints[0].Id}"
-        )
-
-    elif isinstance(
-        request.app.state.router,
-        (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
-    ):
-        server_url = await request.app.state.router.route_request(
-            endpoints, engine_stats, request_stats, request, request_json
-        )
-    else:
-        server_url = request.app.state.router.route_request(
-            endpoints, engine_stats, request_stats, request
-        )
+    server_url = await _select_backend(
+        request, endpoints, engine_stats, request_stats, request_json, request_endpoint
+    )
 
     if isinstance(request.app.state.router, PriorityRouter):
         # PriorityRouter injects the resolved priority into request_json so
@@ -646,19 +893,14 @@ async def route_general_request(
             remaining = [ep for ep in endpoints if ep.url not in error_urls]
             if not remaining:
                 break
-            if request_endpoint:
-                server_url = remaining[0].url
-            elif isinstance(
-                request.app.state.router,
-                (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
-            ):
-                server_url = await request.app.state.router.route_request(
-                    remaining, engine_stats, request_stats, request, request_json
-                )
-            else:
-                server_url = request.app.state.router.route_request(
-                    remaining, engine_stats, request_stats, request
-                )
+            server_url = await _select_backend(
+                request,
+                remaining,
+                engine_stats,
+                request_stats,
+                request_json,
+                request_endpoint,
+            )
             logger.info(
                 f"Routing request {request_id} to {server_url} "
                 f"(attempt {attempt + 1}/{max_attempts})"
@@ -666,7 +908,6 @@ async def route_general_request(
             if span is not None:
                 span.set_attribute("vllm.backend_url", server_url)
 
-        media_type = "text/event-stream"
         try:
             stream_generator = process_request(
                 request,
@@ -677,20 +918,29 @@ async def route_general_request(
                 background_tasks,
                 parent_span_context=span_context,
             )
-            headers, status = await anext(stream_generator)
-            media_type = headers.get("content-type", "text/event-stream")
-            headers_dict = {
-                key: value
-                for key, value in headers.items()
-                if key.lower() not in _HEADERS_TO_STRIP_FROM_RESPONSE
-                and key.lower() != "content-type"
-            }
-            headers_dict["X-Request-Id"] = request_id
-            last_error = None
-            break
+            return await _streaming_backend_response(
+                request, stream_generator, request_id, span
+            )
+        except asyncio.CancelledError:
+            if tracing_active:
+                lifetime = request_lifetime(request)
+                end_span(
+                    span,
+                    status_code=499 if lifetime and lifetime.disconnected else None,
+                )
+            raise
         except HTTPException:
             raise
         except Exception as e:
+            if isinstance(e, TimeoutError) and not isinstance(
+                e, aiohttp.ConnectionTimeoutError
+            ):
+                # Only a connect timeout is an instance failure that fails over.
+                logger.warning(f"Request {request_id} timed out on {server_url}: {e!r}")
+                end_span(span, error=e, status_code=504) if tracing_active else None
+                raise HTTPException(
+                    status_code=504, detail="Backend request timed out."
+                ) from e
             error_urls.add(server_url)
             last_error = e
             logger.warning(
@@ -698,25 +948,138 @@ async def route_general_request(
                 f"(attempt {attempt + 1}/{max_attempts}): {e}"
             )
 
-    if last_error:
-        end_span(span, error=last_error, status_code=500) if tracing_active else None
-        raise last_error
+    end_span(span, error=last_error, status_code=500) if tracing_active else None
+    raise last_error
 
-    # Wrap the generator to end parent span when streaming completes
-    async def traced_stream():
+
+async def route_discovered_inference(
+    request: Request, path: str, background_tasks: BackgroundTasks
+):
+    response_id = response_resource_id(path)
+    if response_id is not None:
+        is_cancel = path.count("/") == 4
+        if request.method != ("POST" if is_cancel else "GET"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        kind = "responses-cancel" if is_cancel else "responses-read"
+    elif request.method == "POST":
+        kind = "inference"
+    else:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    service_discovery = get_service_discovery()
+    endpoints = service_discovery.get_endpoint_info()
+    if response_id is None:
+        endpoints = [ep for ep in endpoints if not ep.sleep]
+    client = request.app.state.aiohttp_client_wrapper()
+    discovery = getattr(request.app.state, "inference_discovery", None)
+    if discovery is None:
+        discovery = request.app.state.inference_discovery = OpenAPIInferenceDiscovery()
+    media_type = (
+        request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    )
+    schema_path = path
+    if response_id is not None:
+        # Match the resource template independently of opaque ID encoding.
+        schema_path = response_resource_path("resp_schema")
+        if kind == "responses-cancel":
+            schema_path += "/cancel"
+    matches = await discovery.eligible_endpoints(
+        client, endpoints, request.method, schema_path, media_type or None, kind=kind
+    )
+    if not matches:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if response_id is not None:
+        # Ownership probes are bodyless. Never send a body to the resource endpoint.
+        if await request.body():
+            raise HTTPException(
+                status_code=400,
+                detail="Responses resource requests do not accept a body.",
+            )
+        owner = await _locate_response_owner(
+            request, service_discovery, endpoints, response_id
+        )
+        if all(ep.url != owner.url for ep, _ in matches):
+            raise HTTPException(
+                status_code=503,
+                detail="Owning engine does not advertise this operation.",
+            )
+        target = response_resource_path(response_id)
+        if kind == "responses-cancel":
+            target += "/cancel"
+        request_id = _request_id(request)
+        stream = process_request(
+            request,
+            None,
+            owner.url,
+            request_id,
+            target,
+            background_tasks,
+            parsed_body={"model": next(iter(owner.model_names), "unknown")},
+        )
         try:
-            async for chunk in stream_generator:
-                yield chunk
-            end_span(span, status_code=status) if tracing_active else None
-        except Exception as e:
-            end_span(span, error=e, status_code=500) if tracing_active else None
-            raise
+            return await _streaming_backend_response(request, stream, request_id)
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise HTTPException(
+                status_code=503, detail="Owning engine is unavailable."
+            ) from exc
 
-    return StreamingResponse(
-        traced_stream(),
-        status_code=status,
-        headers=headers_dict,
-        media_type=media_type,
+    selected_id = request.query_params.get("id")
+    if selected_id is not None:
+        matches = [(ep, operation) for ep, operation in matches if ep.Id == selected_id]
+    if not matches:
+        raise HTTPException(
+            status_code=404, detail="Selected engine does not advertise this operation."
+        )
+
+    target = quote(path, safe="/")
+    if media_type == "multipart/form-data":
+        await request.body()
+        form = await _request_form(request)
+        model = form.get("model")
+    else:
+        try:
+            payload = await request.json()
+        except (ValueError, RecursionError):
+            raise HTTPException(
+                status_code=400, detail="Request body must be valid JSON."
+            ) from None
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=400, detail="Request body must be a JSON object."
+            )
+        model = payload.get("model")
+
+    implicit_model = None
+    if model is None:
+        matches = [
+            (ep, operation) for ep, operation in matches if operation.model_optional
+        ]
+        models = {model_name for ep, _ in matches for model_name in ep.model_names}
+        if len(models) != 1:
+            raise HTTPException(
+                status_code=400, detail="Specify a model for this inference request."
+            )
+        implicit_model = models.pop()
+    elif not isinstance(model, str) or not model:
+        raise HTTPException(status_code=400, detail="Model must be a nonempty string.")
+
+    eligible = [ep for ep, _ in matches]
+    if media_type == "multipart/form-data":
+        return await route_multipart_request(
+            request,
+            target,
+            background_tasks,
+            eligible_endpoints=eligible,
+            implicit_model=implicit_model,
+            parsed_form=form,
+        )
+    return await route_general_request(
+        request,
+        target,
+        background_tasks,
+        eligible_endpoints=eligible,
+        implicit_model=implicit_model,
     )
 
 
@@ -777,7 +1140,7 @@ async def route_orchestrated_disaggregated_request(
     Reference: NxDI/examples/vllm/disaggregated_inference/toy_proxy_server.py
     """
     in_router_time = time.time()
-    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request_id = _request_id(request)
     request_json = await request.json()
     model = request_json.get("model")
     if not model:
@@ -830,7 +1193,8 @@ async def route_orchestrated_disaggregated_request(
     logger.info(f"[{request_id}] Decode endpoint: {decode_url}")
 
     # Step 1: Send to Prefill with max_tokens=1
-    prefill_api_url = f"{prefill_url}{endpoint}"
+    target = _backend_target(request, endpoint)
+    prefill_api_url = prefill_url.rstrip("/") + target
     logger.info(f"[{request_id}] Sending prefill request to {prefill_api_url}")
 
     # Create prefill request with max_tokens=1 to optimize prefill step
@@ -867,6 +1231,7 @@ async def route_orchestrated_disaggregated_request(
             json=prefill_request_json,
             headers=backend_headers,
             timeout=aiohttp.ClientTimeout(total=300),
+            allow_redirects=False,
         ) as prefill_resp:
             if prefill_resp.status != 200:
                 error_text = await prefill_resp.text()
@@ -902,7 +1267,7 @@ async def route_orchestrated_disaggregated_request(
                 f"[{request_id}] Prefill response did not contain kv_transfer_params"
             )
 
-        decode_api_url = f"{decode_url}{endpoint}"
+        decode_api_url = decode_url.rstrip("/") + target
         logger.info(f"[{request_id}] Sending decode request to {decode_api_url}")
 
         decode_resp = await client.post(
@@ -910,7 +1275,9 @@ async def route_orchestrated_disaggregated_request(
             json=decode_request,
             headers=backend_headers,
             timeout=aiohttp.ClientTimeout(total=600),
+            allow_redirects=False,
         )
+        handed_off = False
         try:
             if decode_resp.status != 200:
                 error_text = await decode_resp.text()
@@ -924,6 +1291,14 @@ async def route_orchestrated_disaggregated_request(
                 )
 
             if is_streaming:
+                closed = False
+
+                async def close_decode():
+                    nonlocal closed
+                    if not closed:
+                        closed = True
+                        decode_resp.close()
+
                 # For streaming, yield chunks as they arrive (true streaming)
                 async def generate_stream():
                     try:
@@ -931,17 +1306,24 @@ async def route_orchestrated_disaggregated_request(
                             if chunk:
                                 yield chunk
                     finally:
-                        decode_resp.release()
+                        await close_decode()
                         curr_time = time.time()
                         logger.info(
                             f"[{request_id}] Orchestrated streaming request completed, total time = {curr_time - in_router_time:.4f}s"
                         )
 
-                return StreamingResponse(
-                    generate_stream(),
+                body_iterator = generate_stream()
+                lifetime = request_lifetime(request)
+                if lifetime is not None:
+                    lifetime.add_cleanup(close_decode)
+                    lifetime.add_cleanup(body_iterator.aclose)
+                response = StreamingResponse(
+                    body_iterator,
                     media_type="text/event-stream",
                     headers={"X-Request-Id": request_id},
                 )
+                handed_off = True
+                return response
             else:
                 # For non-streaming, read full response
                 response_data = await decode_resp.read()
@@ -955,9 +1337,9 @@ async def route_orchestrated_disaggregated_request(
                     content=json.loads(response_data),
                     headers={"X-Request-Id": request_id},
                 )
-        except Exception:
-            decode_resp.release()
-            raise
+        finally:
+            if not handed_off:
+                decode_resp.close()
 
     except aiohttp.ClientError as e:
         logger.error(
@@ -987,7 +1369,8 @@ async def route_disaggregated_prefill_request(
 ):
     in_router_time = time.time()
     # Same as vllm, Get request_id from X-Request-Id header if available
-    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request_id = _request_id(request)
+    target = _backend_target(request, endpoint)
     request_json = await request.json()
 
     # Save original request for decode phase
@@ -1002,7 +1385,7 @@ async def route_disaggregated_prefill_request(
     st = time.time()
     try:
         await send_request_to_prefiller(
-            request.app.state.prefill_client, endpoint, request_json, request_id
+            request.app.state.prefill_client, target, request_json, request_id
         )
         et = time.time()
         logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
@@ -1040,10 +1423,13 @@ async def route_disaggregated_prefill_request(
 
     async def generate_stream():
         try:
-            async for chunk in send_request_to_decode(
-                request.app.state.decode_client, endpoint, request_json, request_id
-            ):
-                yield chunk
+            async with aclosing(
+                send_request_to_decode(
+                    request.app.state.decode_client, target, request_json, request_id
+                )
+            ) as chunks:
+                async for chunk in chunks:
+                    yield chunk
         except aiohttp.ClientResponseError as e:
             logger.error(f"HTTP error in decoder: {e}", exc_info=True)
             try:
@@ -1076,8 +1462,12 @@ async def route_disaggregated_prefill_request(
         f"Routing request {request_id} with session id None to {request.app.state.decode_client._base_url} at {curr_time}, process time = {curr_time - et:.4f}"
     )
 
+    body_iterator = generate_stream()
+    lifetime = request_lifetime(request)
+    if lifetime is not None:
+        lifetime.add_cleanup(body_iterator.aclose)
     return StreamingResponse(
-        generate_stream(),
+        body_iterator,
         media_type="application/json",
         headers={"X-Request-Id": request_id},
     )
@@ -1173,6 +1563,14 @@ async def route_sleep_wakeup_request(
             )
 
 
+async def _request_form(request: Request) -> RequestFormData:
+    form = await request.form()
+    lifetime = request_lifetime(request)
+    if lifetime is not None:
+        lifetime.add_cleanup(form.close)
+    return form
+
+
 async def route_general_transcriptions(
     request: Request,
     endpoint: str,  # "/v1/audio/transcriptions"
@@ -1180,10 +1578,10 @@ async def route_general_transcriptions(
 ):
     """Handles audio transcription requests by parsing form data and proxying to backend."""
 
-    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request_id = _request_id(request)
 
     try:
-        form = await request.form()
+        form = await _request_form(request)
 
         file: UploadFile = form["file"]
         model: str = form["model"]
@@ -1270,13 +1668,17 @@ async def route_multipart_request(
     request: Request,
     endpoint: str,
     background_tasks: BackgroundTasks,
+    *,
+    eligible_endpoints: list[EndpointInfo] | None = None,
+    implicit_model: str | None = None,
+    parsed_form: RequestFormData | None = None,
 ):
     """Route OpenAI-compatible multipart/form-data requests."""
 
     body = await request.body()
     try:
-        form = await request.form()
-        model: str = form.get("model")
+        form = await _request_form(request) if parsed_form is None else parsed_form
+        model = form.get("model") or implicit_model
     except Exception:
         return JSONResponse(
             status_code=400,
@@ -1290,10 +1692,12 @@ async def route_multipart_request(
         model,
         endpoint,
         request,
+        stream=str(form.get("stream", "")).lower() == "true",
         request_fields={
             key: value for key, value in form.multi_items() if isinstance(value, str)
         },
         request_form=form,
+        eligible_endpoints=eligible_endpoints,
     )
 
 
@@ -1306,8 +1710,9 @@ async def proxy_multipart_request(
     stream: bool = False,
     request_fields: dict[str, str] | None = None,
     request_form: RequestFormData | None = None,
+    eligible_endpoints: list[EndpointInfo] | None = None,
 ):
-    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    request_id = _request_id(request)
     stats_request_id = str(uuid.uuid4())
 
     if not model:
@@ -1322,7 +1727,16 @@ async def proxy_multipart_request(
     engine_stats_scraper = request.app.state.engine_stats_scraper
     request_stats_monitor = request.app.state.request_stats_monitor
 
-    endpoints = service_discovery.get_endpoint_info()
+    endpoints = (
+        service_discovery.get_endpoint_info()
+        if eligible_endpoints is None
+        else eligible_endpoints
+    )
+    rewrites = {}
+    if eligible_endpoints is not None:
+        aliases = getattr(service_discovery, "aliases", None) or {}
+        if model in aliases:
+            model = rewrites["model"] = aliases[model]
 
     endpoints = [ep for ep in endpoints if model in ep.model_names and not ep.sleep]
 
@@ -1340,7 +1754,16 @@ async def proxy_multipart_request(
     request_fields.setdefault("prompt", "")
 
     # pick one using the router's configured logic (roundrobin, least-loaded, etc.)
-    if isinstance(
+    if eligible_endpoints is not None:
+        chosen_url = await _select_backend(
+            request,
+            endpoints,
+            engine_stats,
+            request_stats,
+            request_fields,
+            request.query_params.get("id"),
+        )
+    elif isinstance(
         router,
         (
             KvawareRouter,
@@ -1373,14 +1796,15 @@ async def proxy_multipart_request(
             request,
         )
     if isinstance(router, PriorityRouter):
-        priority_field = router.priority_field
-        priority = str(request_fields[priority_field])
+        rewrites[router.priority_field] = str(request_fields[router.priority_field])
+    if rewrites:
         if request_form is None:
-            form_data.add_field(priority_field, priority)
+            for key, value in rewrites.items():
+                form_data.add_field(key, value)
         else:
             forwarded_form = aiohttp.FormData()
             for key, value in request_form.multi_items():
-                if key == priority_field:
+                if key in rewrites:
                     continue
                 if isinstance(value, RequestUploadFile):
                     forwarded_form.add_field(
@@ -1391,7 +1815,8 @@ async def proxy_multipart_request(
                     )
                 else:
                     forwarded_form.add_field(key, value)
-            forwarded_form.add_field(priority_field, priority)
+            for key, value in rewrites.items():
+                forwarded_form.add_field(key, value)
             form_data = forwarded_form
     logger.info(
         "Proxying multi-part form request for model %s to %s", model, chosen_url
@@ -1409,16 +1834,32 @@ async def proxy_multipart_request(
 
         try:
             backend_response = await client.post(
-                f"{chosen_url}{endpoint}",
+                chosen_url.rstrip("/") + _backend_target(request, endpoint),
                 data=form_data,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=300),
+                allow_redirects=False,
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             request_stats_monitor.on_request_complete(
                 chosen_url, stats_request_id, time.time()
             )
             raise
+
+        closed = False
+
+        async def close_response():
+            nonlocal closed
+            if not closed:
+                closed = True
+                backend_response.close()
+                request_stats_monitor.on_request_complete(
+                    chosen_url, stats_request_id, time.time()
+                )
+
+        lifetime = request_lifetime(request)
+        if lifetime is not None:
+            lifetime.add_cleanup(close_response)
 
         resp_headers = {
             k: v
@@ -1441,13 +1882,13 @@ async def proxy_multipart_request(
                         if chunk:
                             yield chunk
                 finally:
-                    backend_response.close()
-                    request_stats_monitor.on_request_complete(
-                        chosen_url, stats_request_id, time.time()
-                    )
+                    await close_response()
 
+            body_iterator = traced_stream()
+            if lifetime is not None:
+                lifetime.add_cleanup(body_iterator.aclose)
             return StreamingResponse(
-                traced_stream(),
+                body_iterator,
                 status_code=backend_response.status,
                 headers=resp_headers,
                 media_type=backend_response.headers.get(
@@ -1487,10 +1928,7 @@ async def proxy_multipart_request(
                 headers=resp_headers,
             )
         finally:
-            backend_response.close()
-            request_stats_monitor.on_request_complete(
-                chosen_url, stats_request_id, time.time()
-            )
+            await close_response()
     except aiohttp.ClientResponseError as response_error:
         if response_error.response is not None:
             try:

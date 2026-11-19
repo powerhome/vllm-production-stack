@@ -297,3 +297,35 @@ def test_loadaware_reload_preserves_controller_settings(
         assert watcher.app.state.router.max_instance_failover_reroute_attempts == 4
     finally:
         routing_logic.cleanup_routing_logic()
+
+
+_STATIC_ARGS = [
+    "--service-discovery",
+    "static",
+    "--static-backends",
+    "http://localhost:8000",
+    "--static-models",
+    "m1",
+    "--routing-logic",
+    "roundrobin",
+]
+
+
+def test_parse_args_backend_request_timeout_defaults_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", [sys.argv[0], *_STATIC_ARGS])
+    assert parser.parse_args().backend_request_timeout_seconds is None
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_parse_args_backend_request_timeout_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [sys.argv[0], *_STATIC_ARGS, "--backend-request-timeout-seconds", value],
+    )
+    with pytest.raises(ValueError, match="Backend request timeout"):
+        parser.parse_args()
